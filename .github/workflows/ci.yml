@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Format
+        run: |
+          go fmt ./...
+          git diff --exit-code
+      - name: Check Go packages
+        shell: pwsh
+        run: |
+          $packages = @(go list ./...)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($packages.Count -eq 0) {
+            Write-Host "No Go packages to check."
+            exit 0
+          }
+          go vet $packages
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test $packages
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go build $packages
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

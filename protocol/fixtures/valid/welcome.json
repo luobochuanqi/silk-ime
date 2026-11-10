@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": 1,
+  "type": "welcome",
+  "payload": {
+    "v": 1,
+    "cfg": {
+      "page_size": 9,
+      "chinese": true,
+      "full_punct": true
+    }
+  }
+}

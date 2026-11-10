@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "id": 43,
+  "type": "action",
+  "sid": "s-7f3a",
+  "payload": {
+    "kind": "select",
+    "index": 2
+  }
+}

@@ -64,8 +64,8 @@ graph LR
 | `focus_in` | shim→host | 焦点进入文档 | `app, hwnd, lang_hint` |
 | `focus_out` | shim→host | 焦点离开 | `sid` |
 | `key` | shim→host | 语义键事件 | `code, down, mods, ts` |
-| `action` | shim→host | 选择/翻页/模式切换/取消 | `kind, index?/mode?` |
-| `update` | host→shim | 状态更新：preedit、候选、模式 | `preedit, caret, candidates[], mode` |
+| `action` | shim→host | 选择/翻页/模式切换/取消 | `kind, index?（select/page）, mode?={chinese, full_punct}（toggle）` |
+| `update` | host→shim | 状态更新：preedit、候选、模式 | `preedit, caret, candidates[], page_index, mode={chinese, full_punct}` |
 | `commit` | host→shim | 上屏文本 | `text` |
 | `caret` | host→shim | 候选窗定位请求（shim 回坐标） | `rect`（shim→host 回填屏幕坐标） |
 | `show` / `hide` | host→shim | 候选窗显隐（用于 host_render 兜底通道） | `view?` |

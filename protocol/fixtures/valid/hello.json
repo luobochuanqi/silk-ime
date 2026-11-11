@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "id": 1,
+  "type": "hello",
+  "payload": {
+    "v": 1,
+    "caps": 3,
+    "build": "0.1.0"
+  }
+}

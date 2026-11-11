@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "id": 2,
+  "type": "focus_in",
+  "payload": {
+    "app": "notepad.exe",
+    "hwnd": 66052,
+    "lang_hint": "zh-Hans"
+  }
+}

@@ -1,0 +1,6 @@
+# 静态 CRT：产物不依赖 VC++ 运行库（07 安装红线，缺运行库是竞品头号安装故障）
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,0 +1,4 @@
+{
+  "reason": "长度前缀为 0xffffffff，超过 1 MiB 上限",
+  "frame_hex": "ffffffff"
+}

@@ -1,0 +1,22 @@
+{
+  "v": 1,
+  "id": 43,
+  "type": "update",
+  "sid": "s-7f3a",
+  "payload": {
+    "preedit": "hao",
+    "caret": 3,
+    "candidates": [
+      {
+        "text": "好",
+        "comment": "hao3"
+      },
+      {
+        "text": "号",
+        "comment": "hao4"
+      }
+    ],
+    "page_index": 0,
+    "mode": {"chinese": true, "full_punct": true}
+  }
+}

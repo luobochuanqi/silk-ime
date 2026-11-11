@@ -37,3 +37,5 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           go build $packages
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check protocol (Rust)
+        run: cargo test --manifest-path native/protocol/Cargo.toml

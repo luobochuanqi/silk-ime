@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "id": 43,
+  "type": "error",
+  "sid": "s-7f3a",
+  "payload": {
+    "id": 43,
+    "code": 3,
+    "msg": "会话繁忙"
+  }
+}

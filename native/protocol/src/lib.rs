@@ -294,17 +294,25 @@ fn validate_field(value: &Value, field: &Field) -> Result<(), String> {
     }
 }
 
-/// 将 `payload` 作为一帧写入 `w`：u32 小端长度前缀 + 帧体。
-pub fn write_frame(w: &mut impl Write, payload: &[u8]) -> Result<(), Error> {
-    if payload.len() > MAX_FRAME_SIZE {
-        return Err(Error::FrameTooLarge(payload.len()));
+/// 将一整帧（[`encode`] 的产物）写入 `w`，整帧一次写入。
+///
+/// 帧自带 u32 长度前缀；写前校验前缀完整性，不匹配视为编程错误。
+pub fn write_frame(w: &mut impl Write, frame: &[u8]) -> Result<(), Error> {
+    if frame.len() < 4 {
+        return Err(invalid("帧短于长度前缀"));
     }
-    w.write_all(&(payload.len() as u32).to_le_bytes())?;
-    w.write_all(payload)?;
+    let n = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    if n > MAX_FRAME_SIZE {
+        return Err(Error::FrameTooLarge(n));
+    }
+    if n != frame.len() - 4 {
+        return Err(invalid("长度前缀与实际不符"));
+    }
+    w.write_all(frame)?;
     Ok(())
 }
 
-/// 从 `r` 读取一帧并返回帧体。
+/// 从 `r` 读取一帧并返回完整帧（含长度前缀），可直接交给 [`decode`]。
 ///
 /// 长度前缀超限返回 [`Error::FrameTooLarge`]；此时流位置已不可恢复，调用方必须断开。
 pub fn read_frame(r: &mut impl Read) -> Result<Vec<u8>, Error> {
@@ -314,9 +322,10 @@ pub fn read_frame(r: &mut impl Read) -> Result<Vec<u8>, Error> {
     if n > MAX_FRAME_SIZE {
         return Err(Error::FrameTooLarge(n));
     }
-    let mut payload = vec![0u8; n];
-    r.read_exact(&mut payload)?;
-    Ok(payload)
+    let mut frame = vec![0u8; 4 + n];
+    frame[..4].copy_from_slice(&header);
+    r.read_exact(&mut frame[4..])?;
+    Ok(frame)
 }
 
 /// 校验封套后编码为整帧（长度前缀 + JSON）。
@@ -324,7 +333,8 @@ pub fn encode(env: &Envelope) -> Result<Vec<u8>, Error> {
     env.validate()?;
     let body = serde_json::to_vec(env).map_err(|err| invalid(format!("序列化封套: {err}")))?;
     let mut frame = Vec::with_capacity(4 + body.len());
-    write_frame(&mut frame, &body)?;
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&body);
     Ok(frame)
 }
 

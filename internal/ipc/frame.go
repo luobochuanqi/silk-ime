@@ -1,7 +1,6 @@
 package ipc
 
 import (
-	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -21,28 +20,32 @@ var (
 	ErrInvalidMessage = errors.New("ipc: 消息无效")
 )
 
-// WriteFrame 将 payload 作为一帧写入 w：u32 小端长度前缀 + 帧体。
+// WriteFrame 将一整帧（Encode 的产物）写入 w，整帧单次写入。
 //
-// 帧头和帧体各写一次；w 的错误经 %w 包装后返回。
-func WriteFrame(w io.Writer, payload []byte) error {
-	if len(payload) > MaxFrameSize {
-		return fmt.Errorf("%w: %d 字节", ErrFrameTooLarge, len(payload))
+// 帧自带 u32 长度前缀；写前校验前缀完整性，不匹配视为编程错误。
+// 必须单次 Write：消息模式管道按写分消息，分次写会劈开帧边界。w 的错误经 %w 包装后返回。
+func WriteFrame(w io.Writer, frame []byte) error {
+	if len(frame) < 4 {
+		return fmt.Errorf("%w: 帧短于长度前缀", ErrInvalidMessage)
 	}
-	var header [4]byte
-	binary.LittleEndian.PutUint32(header[:], uint32(len(payload)))
-	if _, err := w.Write(header[:]); err != nil {
-		return fmt.Errorf("ipc: 写入帧头: %w", err)
+	n := binary.LittleEndian.Uint32(frame)
+	if n > MaxFrameSize {
+		return fmt.Errorf("%w: %d 字节", ErrFrameTooLarge, n)
 	}
-	if _, err := w.Write(payload); err != nil {
-		return fmt.Errorf("ipc: 写入帧体: %w", err)
+	if int(n) != len(frame)-4 {
+		return fmt.Errorf("%w: 长度前缀 %d 与实际 %d 不符", ErrInvalidMessage, n, len(frame)-4)
+	}
+	if _, err := w.Write(frame); err != nil {
+		return fmt.Errorf("ipc: 写入帧: %w", err)
 	}
 	return nil
 }
 
-// ReadFrame 从 r 读取一帧并返回帧体。返回的切片由调用方独占。
+// ReadFrame 从 r 读取一帧并返回完整帧（含长度前缀），可直接交给 Decode。
 //
-// 长度前缀超限时返回 ErrFrameTooLarge；流在帧头前结束返回 io.EOF，帧体
-// 不完整返回 io.ErrUnexpectedEOF。超限后流位置已不可恢复，调用方必须断开。
+// 返回的切片由调用方独占。长度前缀超限时返回 ErrFrameTooLarge；流在帧头前
+// 结束返回 io.EOF，帧体不完整返回 io.ErrUnexpectedEOF。超限后流位置已不可
+// 恢复，调用方必须断开。
 func ReadFrame(r io.Reader) ([]byte, error) {
 	var header [4]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
@@ -52,11 +55,12 @@ func ReadFrame(r io.Reader) ([]byte, error) {
 	if n > MaxFrameSize {
 		return nil, fmt.Errorf("%w: %d 字节", ErrFrameTooLarge, n)
 	}
-	payload := make([]byte, n)
-	if _, err := io.ReadFull(r, payload); err != nil {
+	frame := make([]byte, 4+n)
+	copy(frame, header[:])
+	if _, err := io.ReadFull(r, frame[4:]); err != nil {
 		return nil, fmt.Errorf("ipc: 读取帧体: %w", err)
 	}
-	return payload, nil
+	return frame, nil
 }
 
 // Encode 校验封套语义后返回整帧（长度前缀 + JSON）。
@@ -70,12 +74,10 @@ func Encode(env Envelope) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: 序列化封套: %v", ErrInvalidMessage, err)
 	}
-	var buf bytes.Buffer
-	buf.Grow(4 + len(body))
-	if err := WriteFrame(&buf, body); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	frame := make([]byte, 4+len(body))
+	binary.LittleEndian.PutUint32(frame, uint32(len(body)))
+	copy(frame[4:], body)
+	return frame, nil
 }
 
 // Decode 解析整帧并做语义校验。

@@ -34,7 +34,7 @@ graph LR
 
 选型理由：消息边界天然、内核级 per-用户 ACL、先例一致（青简 `\\.\pipe\qingjian`、WeaselIPC 同构）。
 
-- 模式：`PIPE_TYPE_MESSAGE`，重叠 I/O；shim 侧单 IO 线程，host 侧每连接一个读循环。
+- 模式：字节模式 + 长度前缀自定界（集成实测：消息模式管道按写分消息，会劈开帧边界；长度前缀已自定界，消息模式冗余）；shim 侧单 IO 线程，host 侧每连接一个读循环。
 - `PIPE_REJECT_REMOTE_CLIENTS`：拒绝远程客户端。
 - 连接是长连接：TIP 实例生命周期内复用；断开由上层负责重连（见故障语义）。
 
@@ -63,11 +63,11 @@ graph LR
 | `welcome` | host→shim | 版本协商结果、全局配置快照（模式默认值等） | `v, cfg` |
 | `focus_in` | shim→host | 焦点进入文档 | `app, hwnd, lang_hint` |
 | `focus_out` | shim→host | 焦点离开 | `sid` |
-| `key` | shim→host | 语义键事件 | `code, down, mods, ts` |
+| `key` | shim→host | 语义键事件 | `code, rune?, down, mods, ts` |
 | `action` | shim→host | 选择/翻页/模式切换/取消 | `kind, index?（select/page）, mode?={chinese, full_punct}（toggle）` |
 | `update` | host→shim | 状态更新：preedit、候选、模式 | `preedit, caret, candidates[], page_index, mode={chinese, full_punct}` |
 | `commit` | host→shim | 上屏文本 | `text` |
-| `caret` | host→shim | 候选窗定位请求（shim 回坐标） | `rect`（shim→host 回填屏幕坐标） |
+| `caret` | shim→host | 插入点屏幕坐标（候选窗锚点） | `rect{x,y,w,h}`（随 update 按需发） |
 | `show` / `hide` | host→shim | 候选窗显隐（用于 host_render 兜底通道） | `view?` |
 | `ping` / `pong` | 双向 | 存活探测（空闲期 30 s） | `ts` |
 | `error` | host→shim | 请求失败 | `id, code, msg` |

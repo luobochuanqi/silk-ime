@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 
 	"github.com/luobochuanqi/silk-ime/internal/engine"
@@ -81,12 +82,26 @@ type pingMsg struct {
 	TS uint64 `json:"ts"`
 }
 
+type rectMsg struct {
+	X int32 `json:"x"`
+	Y int32 `json:"y"`
+	W int32 `json:"w"`
+	H int32 `json:"h"`
+}
+
+type caretMsg struct {
+	Rect rectMsg `json:"rect"`
+}
+
 // conn 是单条 shim 连接的协议处理器；读循环即该连接全部会话的串行调用方。
 type conn struct {
 	nc         net.Conn
 	mgr        *session.Manager
+	cw         *candidateWindow
 	snapshot   cfgSnapshot
 	handshaked bool
+	owner      uintptr
+	anchor     silkRect
 }
 
 func (c *conn) send(typ, sid string, payload any) error {
@@ -116,12 +131,14 @@ func (c *conn) run() {
 		}
 		env, err := ipc.Decode(frame)
 		if err != nil {
+			log.Printf("解码失败（断开连接）: %v", err)
 			return
 		}
 		if !c.handshaked && env.Type != "hello" && env.Type != "ping" {
 			c.sendError(env.SID, env.ID, 400, "未握手")
 			return
 		}
+		log.Printf("收到 %s", env.Type)
 		if !c.dispatch(env) {
 			return
 		}
@@ -147,7 +164,16 @@ func (c *conn) dispatch(env ipc.Envelope) bool {
 			return true
 		}
 		c.mgr.FocusIn(env.SID, msg.App)
+		c.owner = uintptr(msg.HWND)
 		c.sendResponse(env.SID, engine.Response{Mode: engine.Mode{Chinese: c.snapshot.Chinese, FullPunct: c.snapshot.FullPunct}})
+
+	case "caret":
+		var msg caretMsg
+		if err := json.Unmarshal(env.Payload, &msg); err != nil {
+			c.sendError(env.SID, env.ID, 400, "caret 载荷非法")
+			return true
+		}
+		c.anchor = silkRect{x: msg.Rect.X, y: msg.Rect.Y, w: msg.Rect.W, h: msg.Rect.H}
 
 	case "focus_out":
 		resp, err := c.mgr.FocusOut(env.SID)
@@ -156,6 +182,7 @@ func (c *conn) dispatch(env ipc.Envelope) bool {
 			return true
 		}
 		c.sendResponse(env.SID, resp)
+		c.cw.hideWindow()
 
 	case "key":
 		var msg keyMsg
@@ -227,7 +254,8 @@ func (c *conn) handleAction(sid string, msg actionMsg) (engine.Response, error) 
 	}
 }
 
-// sendResponse 把引擎响应拆为 update（总是）与 commit（有上屏时）两条消息。
+// sendResponse 把引擎响应拆为 update（总是）与 commit（有上屏时）两条消息，
+// 并驱动候选窗可见性（06 状态机：有候选且 caret 有效显示，commit/空候选/失焦隐藏）。
 func (c *conn) sendResponse(sid string, resp engine.Response) {
 	cands := make([]candidateMsg, 0, len(resp.Candidates))
 	for _, cd := range resp.Candidates {
@@ -242,7 +270,14 @@ func (c *conn) sendResponse(sid string, resp engine.Response) {
 	})
 	if resp.Commit != "" {
 		_ = c.send("commit", sid, commitMsg{Text: resp.Commit})
+		c.cw.hideWindow()
+		return
 	}
+	if len(cands) > 0 {
+		c.cw.render(resp.Preedit, cands, resp.PageIndex, c.anchor, c.owner)
+		return
+	}
+	c.cw.hideWindow()
 }
 
 func firstRune(s string) rune {

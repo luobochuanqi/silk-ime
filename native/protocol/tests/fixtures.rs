@@ -100,8 +100,10 @@ fn oversized_length_is_rejected() {
     assert!(matches!(decode(&[0xff; 4]), Err(Error::FrameTooLarge(_))));
 
     let mut sink = Vec::new();
+    let mut oversized = vec![0u8; 8];
+    oversized[..4].copy_from_slice(&((MAX_FRAME_SIZE + 1) as u32).to_le_bytes());
     assert!(matches!(
-        silk_protocol::write_frame(&mut sink, &vec![0u8; MAX_FRAME_SIZE + 1]),
+        silk_protocol::write_frame(&mut sink, &oversized),
         Err(Error::FrameTooLarge(_))
     ));
 }

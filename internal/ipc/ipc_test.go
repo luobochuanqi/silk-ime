@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,11 +19,10 @@ const fixtureRoot = "../../protocol/fixtures"
 
 func frameFixture(t *testing.T, body []byte) []byte {
 	t.Helper()
-	var buf bytes.Buffer
-	if err := WriteFrame(&buf, body); err != nil {
-		t.Fatalf("构造帧失败: %v", err)
-	}
-	return buf.Bytes()
+	frame := make([]byte, 4+len(body))
+	binary.LittleEndian.PutUint32(frame, uint32(len(body)))
+	copy(frame[4:], body)
+	return frame
 }
 
 // decodePayload 取载荷的通用表示，用于比较编解码前后的语义相等。
@@ -130,9 +130,16 @@ func TestDecodeRejectsOversizedLength(t *testing.T) {
 	if _, err := ReadFrame(bytes.NewReader(frame)); !errors.Is(err, ErrFrameTooLarge) {
 		t.Fatalf("ReadFrame 期望 ErrFrameTooLarge，实际 %v", err)
 	}
-	if err := WriteFrame(io.Discard, make([]byte, MaxFrameSize+1)); !errors.Is(err, ErrFrameTooLarge) {
+	if err := WriteFrame(io.Discard, oversizedFrame(MaxFrameSize+1)); !errors.Is(err, ErrFrameTooLarge) {
 		t.Fatalf("WriteFrame 期望 ErrFrameTooLarge，实际 %v", err)
 	}
+}
+
+// oversizedFrame 构造长度前缀为 n 的最小帧（实际帧体不符，用于超限分支）。
+func oversizedFrame(n uint32) []byte {
+	frame := make([]byte, 8)
+	binary.LittleEndian.PutUint32(frame, n)
+	return frame
 }
 
 func TestReadFrameErrors(t *testing.T) {

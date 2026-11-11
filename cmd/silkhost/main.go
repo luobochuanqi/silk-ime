@@ -6,10 +6,12 @@ package main
 import (
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -42,6 +44,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("配置: %v", err)
 	}
+	// ponytail: 日志仅追加不滚动；M2 按 08 设计做 5×2MB 滚动与脱敏结构化
+	if err := os.MkdirAll(paths.Logs, 0o755); err == nil {
+		if f, err := os.OpenFile(filepath.Join(paths.Logs, "silkhost.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+			defer f.Close()
+			log.SetOutput(io.MultiWriter(os.Stderr, f))
+		}
+	}
 
 	dictData, err := os.ReadFile(*dictPath)
 	if err != nil {
@@ -60,6 +69,10 @@ func main() {
 		log.Fatalf("引擎: %v", err)
 	}
 	mgr := session.NewManager(eng, paths.UserDict)
+	cw, err := loadCandidateWindow()
+	if err != nil {
+		log.Printf("候选窗不可用（无窗模式）: %v", err)
+	}
 
 	sid, err := currentUserSID()
 	if err != nil {
@@ -71,9 +84,10 @@ func main() {
 	}
 	ln, err := winio.ListenPipe(name, &winio.PipeConfig{
 		SecurityDescriptor: "D:P(A;;GA;;;" + sid + ")",
-		MessageMode:        true,
-		InputBufferSize:    64 << 10,
-		OutputBufferSize:   64 << 10,
+		// 字节模式：帧由长度前缀自定界；消息模式按写分消息会劈开帧边界
+		MessageMode:      false,
+		InputBufferSize:  64 << 10,
+		OutputBufferSize: 64 << 10,
 	})
 	if err != nil {
 		// 管道被占用 = 已有实例在运行（ADR-5 单实例保证），静默退出。
@@ -110,7 +124,8 @@ func main() {
 			lastActive.Store(time.Now().UnixNano())
 			go func(nc net.Conn) {
 				defer activeConn.Add(-1)
-				c := &conn{nc: nc, mgr: mgr, snapshot: cfgSnapshot{
+				log.Print("接受 shim 连接")
+				c := &conn{nc: nc, mgr: mgr, cw: cw, snapshot: cfgSnapshot{
 					PageSize:  cfg.PageSize,
 					Chinese:   true,
 					FullPunct: true,

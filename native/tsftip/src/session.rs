@@ -106,6 +106,11 @@ impl Session {
         self.client.post(env);
     }
 
+    /// 让后台线程开始建连；不阻塞调用方（焦点进入时调用，避免首键白白直通）。
+    pub fn warm(&self) {
+        self.client.warm();
+    }
+
     /// 把下行消息转成编辑意图，并同步模式缓存。
     pub fn absorb(&self, messages: &[Incoming]) -> Vec<EditIntent> {
         let mut intents = Vec::new();

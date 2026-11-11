@@ -1,17 +1,20 @@
-//! 命名管道客户端：读线程 + 请求通道。
+//! 命名管道客户端：读线程 + 请求通道 + 后台连接线程。
 //!
-//! TSF 回调线程只做一次有界等待（15 ms），协议读写全部落在独立线程上，保证宿主
-//! UI 线程不会被管道或 host 拉起阻塞。会话事实（模式、连接态）用共享状态下发，
-//! 读侧不加锁。
+//! TSF 回调线程只做一次有界等待（15 ms），协议读写、连接与 host 拉起全部落在
+//! 独立线程上：回调路径永不等待连接建立，未就绪时按键走 fail-open 直通，连接
+//! 就绪后由下一次请求自动接上。
 //!
 //! 句柄以 `FILE_FLAG_OVERLAPPED` 打开，读写全部走重叠 I/O：同步句柄上「一线程
 //! 阻塞在 ReadFile、另一线程 WriteFile」会被内核串行化而互相锁死（实测写侧无限
 //! 阻塞），重叠 I/O 让读写各自排队，常驻读与并发写不再互斥。
+//!
+//! 传输是字节模式 + u32 长度前缀自定界（04「传输层」）：一帧一次写，读侧按前缀
+//! 重组，不依赖管道的消息边界。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -39,12 +42,16 @@ use crate::util;
 pub const KEY_TIMEOUT: Duration = Duration::from_millis(15);
 /// 拉起 host 后等 `welcome` 就绪的上限。
 const SPAWN_WAIT: Duration = Duration::from_secs(2);
-/// 同一响应常带 update 和 commit 两帧；有 update 后只再等这么点时间收尾帧。
+/// 空转时等命令的切片：worker 借此检查后台连接与空闲 ping。
+const WORKER_TICK: Duration = Duration::from_millis(500);
+/// 空闲存活探测间隔（04:72）：无任何请求时每 30 s 发一次 ping。
+const IDLE_PING: Duration = Duration::from_secs(30);
+/// 同一响应常带 update 和 commit 两帧；收到 update 后只再等这么点时间收尾帧。
 const TAIL_WAIT: Duration = Duration::from_millis(2);
 /// host 拉起限速：每分钟最多 3 次。
 const SPAWN_BUDGET: usize = 3;
 const SPAWN_WINDOW: Duration = Duration::from_secs(60);
-/// 单次 ReadFile 的缓冲；消息模式下一次读就是一条消息。
+/// 单次 ReadFile 的缓冲；字节模式下一次读可能跨多帧或半帧，按前缀重组。
 const BUF_SIZE: usize = 64 * 1024;
 /// 重叠等待的切片：读线程据此察觉关闭，关闭路径另用 CancelIoEx 立即唤醒。
 const WAIT_SLICE_MS: u32 = 20;
@@ -61,6 +68,17 @@ pub enum Reply {
     Disconnected,
 }
 
+/// 当前焦点会话，供连接（重）建立时补发 `focus_in`。
+///
+/// 建连在后台线程上异步完成，焦点进入回调多半拿不到连接；没有这一步，新建的
+/// 连接不知道当前 sid，之后每个 `key` 都只会收到「未知会话」。
+#[derive(Clone)]
+pub struct Focus {
+    pub sid: String,
+    pub app: String,
+    pub hwnd: u64,
+}
+
 /// 跨线程共享的会话事实。TSF 回调只读这些，避免每键回查连接。
 pub struct Shared {
     mode: Mutex<Mode>,
@@ -68,6 +86,7 @@ pub struct Shared {
     connected: AtomicBool,
     /// 累计失败次数，供诊断读取（08）。
     failures: AtomicU32,
+    focus: Mutex<Option<Focus>>,
 }
 
 impl Shared {
@@ -77,7 +96,17 @@ impl Shared {
             page_size: AtomicU32::new(5),
             connected: AtomicBool::new(false),
             failures: AtomicU32::new(0),
+            focus: Mutex::new(None),
         }
+    }
+
+    /// 记录（或清除）当前焦点会话；连接建立后由后台线程补发 `focus_in`。
+    pub fn set_focus(&self, focus: Option<Focus>) {
+        *self.focus.lock().unwrap_or_else(|e| e.into_inner()) = focus;
+    }
+
+    fn focus(&self) -> Option<Focus> {
+        self.focus.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn mode(&self) -> Mode {
@@ -117,34 +146,152 @@ struct Command {
     reply: Sender<Reply>,
 }
 
-/// 协议客户端。内部只有一个 IO 线程，克隆的是句柄不是连接。
+/// 后台连接线程与 IO 线程共享的连接槽。
+///
+/// 建连（含 `CreateProcess` 拉起 host 与等 `welcome`，上限 2 s）只在这个槽的
+/// 后台线程上发生，TSF 回调路径永远不等它：未就绪时按键直接 fail-open。
+struct Link {
+    /// 已建好、尚未被 IO 线程取走的连接。
+    ready: Handoff,
+    state: Mutex<LinkState>,
+    wake: Condvar,
+}
+
+/// 跨线程移交的连接。
+///
+/// `Pipe` 持有 Win32 句柄（`HANDLE` 是裸指针，windows-rs 不给它 `Send`），但句柄
+/// 本身可跨线程使用；这里的所有权由 `Mutex` 串行移交——同一时刻只有一个线程持有
+/// 连接，不存在并发访问。
+struct Handoff(Mutex<Option<Pipe>>);
+
+// SAFETY: 唯一的访问入口是 `Mutex`，`publish`/`take` 都在持锁期间完成整段移交；
+// `Pipe` 内部没有线程亲和状态（读线程用裸值共享句柄，见 `Pipe::connect`）。
+unsafe impl Send for Handoff {}
+// SAFETY: 同 `Send`：`Mutex` 保证互斥，取出的连接随后只被取走它的线程使用。
+unsafe impl Sync for Handoff {}
+
+impl Handoff {
+    fn new() -> Handoff {
+        Handoff(Mutex::new(None))
+    }
+
+    fn take(&self) -> Option<Pipe> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn publish(&self, pipe: Pipe) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+    }
+}
+
+#[derive(Default)]
+struct LinkState {
+    /// IO 线程发现需要连接（首个请求或断连后）。
+    wanted: bool,
+    /// 有连接等着被取走（publish 置位、take 清零），供 IO 线程有界等待。
+    has_ready: bool,
+    /// 客户端已析构：后台线程退出。
+    stopping: bool,
+}
+
+impl Link {
+    fn new() -> Link {
+        Link {
+            ready: Handoff::new(),
+            state: Mutex::new(LinkState::default()),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, LinkState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 请求建连；重复请求合并成一次（不会排队多次拉起）。
+    fn request(&self) {
+        self.state().wanted = true;
+        self.wake.notify_all();
+    }
+
+    fn stop(&self) {
+        self.state().stopping = true;
+        self.wake.notify_all();
+    }
+
+    fn take(&self) -> Option<Pipe> {
+        let pipe = self.ready.take();
+        if pipe.is_some() {
+            self.state().has_ready = false;
+        }
+        pipe
+    }
+
+    fn publish(&self, pipe: Pipe) {
+        self.ready.publish(pipe);
+        self.state().has_ready = true;
+        self.wake.notify_all();
+    }
+
+    /// 等后台线程交出连接，最多 `timeout`。
+    ///
+    /// 只有 IO 线程调用：TSF 回调从不进来（它只在自己的 15 ms 预算里等回复）。
+    fn wait_ready(&self, timeout: Duration) -> Option<Pipe> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state();
+        loop {
+            if let Some(pipe) = self.ready.take() {
+                state.has_ready = false;
+                return Some(pipe);
+            }
+            if state.stopping {
+                return None;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            state = self
+                .wake
+                .wait_timeout(state, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+}
+
+/// 协议客户端：IO 线程 + 后台连接线程，克隆的是句柄不是连接。
 pub struct Client {
     tx: Sender<Command>,
     shared: Arc<Shared>,
-    worker: Option<JoinHandle<()>>,
+    link: Arc<Link>,
 }
 
 impl Client {
     pub fn new() -> Client {
         let (tx, rx) = mpsc::channel::<Command>();
         let shared = Arc::new(Shared::new());
+        let link = Arc::new(Link::new());
+        let worker_link = Arc::clone(&link);
         let worker_shared = Arc::clone(&shared);
-        let worker = std::thread::Builder::new()
+        // 线程句柄不保存：Client 析构时通知连接线程退出、发送端随之析构，IO 线程
+        // 读到通道关闭自行退出。不 join —— 析构可能发生在 TSF 回调线程上，而连接
+        // 线程此刻可能正在等 2 s 的 host 拉起。
+        let _ = std::thread::Builder::new()
             .name("silk-ipc".to_owned())
-            .spawn(move || worker_loop(rx, worker_shared))
-            .ok();
-        Client {
-            tx,
-            shared,
-            worker,
-        }
+            .spawn(move || worker_loop(rx, worker_shared, worker_link));
+        let connector_shared = Arc::clone(&shared);
+        let connector_link = Arc::clone(&link);
+        let _ = std::thread::Builder::new()
+            .name("silk-ipc-connect".to_owned())
+            .spawn(move || connector_loop(connector_link, connector_shared));
+        Client { tx, shared, link }
     }
 
     pub fn shared(&self) -> Arc<Shared> {
         Arc::clone(&self.shared)
     }
 
-    /// 发一条消息并最多等 `timeout`。
+    /// 发一条消息并最多等 `timeout`。未连接时立即返回，绝不等待建连。
     pub fn request(&self, env: &Envelope, want_reply: bool, timeout: Duration) -> Reply {
         let (tx, rx) = mpsc::channel();
         if self
@@ -165,6 +312,11 @@ impl Client {
         }
     }
 
+    /// 预热连接：只置标志并唤醒后台线程，不等待任何 I/O（TSF 回调可安全调用）。
+    pub fn warm(&self) {
+        self.link.request();
+    }
+
     /// 不等待回应的消息（caret/ping/bye）。
     pub fn post(&self, env: &Envelope) {
         let (tx, _rx) = mpsc::channel();
@@ -178,174 +330,262 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        // 丢掉发送端让 IO 线程退出；连接与读线程随之释放。不 join：
-        // 宿主进程退出时阻塞在管道读上的线程由连接关闭收尾。
-        let _ = &self.worker;
+        // 通知后台连接线程退出；IO 线程在发送端析构后自行退出。
+        self.link.stop();
     }
 }
 
-fn worker_loop(rx: Receiver<Command>, shared: Arc<Shared>) {
-    let mut conn = Connection::default();
-    for cmd in rx {
-        if cmd.want_reply {
-            let reply = conn.handle(&cmd.env, &shared);
-            let _ = cmd.reply.send(reply);
+fn worker_loop(rx: Receiver<Command>, shared: Arc<Shared>, link: Arc<Link>) {
+    let mut pipe: Option<Pipe> = None;
+    let mut last_tx = Instant::now();
+    loop {
+        let cmd = match rx.recv_timeout(WORKER_TICK) {
+            Ok(cmd) => cmd,
+            Err(RecvTimeoutError::Timeout) => {
+                // 空闲保活（04:72）：顺带发现对端已经退出。
+                if pipe.as_ref().is_some_and(Pipe::closed)
+                    || keepalive(&mut pipe, &mut last_tx).is_err()
+                {
+                    drop_pipe(&mut pipe, &shared, &link);
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        if pipe.is_none() {
+            pipe = link.take();
+        }
+        if pipe.is_none() {
+            // 尚未连上：唤醒后台建连，并在这里**有界**等它交出连接。等待发生在 IO
+            // 线程上，TSF 回调早已按自己的 15 ms 预算返回 Disconnected（fail-open）。
+            link.request();
+            pipe = link.wait_ready(SPAWN_WAIT);
+        }
+        let Some(mut conn) = pipe.take() else {
+            // 建连失败：当场 fail-open（04 降级矩阵），后台按限速继续重试。
+            link.request();
+            let _ = cmd.reply.send(Reply::Disconnected);
+            continue;
+        };
+        // 新连接先补发焦点：host 的会话表是 per-连接状态，否则每个 key 都只会收到
+        // 「未知会话」。
+        if let Some(focus) = shared.focus() {
+            if let Ok(frame) = encode(&msg::focus_in(0, &focus.sid, &focus.app, focus.hwnd)) {
+                let _ = conn.write(&frame);
+            }
+        }
+        last_tx = Instant::now();
+        let reply = if cmd.want_reply {
+            exchange(&mut conn, &cmd.env, &shared)
         } else {
-            let _ = conn.send_only(&cmd.env, &shared);
+            post_only(&mut conn, &cmd.env)
+        };
+        if matches!(reply, Reply::Disconnected) {
+            drop_pipe(&mut pipe, &shared, &link);
+        } else {
+            pipe = Some(conn);
         }
+        let _ = cmd.reply.send(reply);
     }
 }
 
-#[derive(Default)]
-struct Connection {
-    pipe: Option<Pipe>,
-    spawns: Vec<Instant>,
+/// 连接因读写失败或对端关闭而不可用：丢弃并让后台线程重连。
+fn drop_pipe(pipe: &mut Option<Pipe>, shared: &Shared, link: &Link) {
+    *pipe = None;
+    shared.connected.store(false, Ordering::Relaxed);
+    shared.failures.fetch_add(1, Ordering::Relaxed);
+    link.request();
 }
 
-impl Connection {
-    fn send_only(&mut self, env: &Envelope, shared: &Shared) -> Reply {
-        if self.pipe.is_none() && !self.connect(shared) {
-            return Reply::Disconnected;
-        }
-        let Some(pipe) = self.pipe.as_mut() else {
-            return Reply::Disconnected;
-        };
-        let Ok(frame) = encode(env) else {
-            return Reply::Disconnected;
-        };
-        if pipe.write(&frame).is_err() {
-            self.drop_pipe(shared);
-            return Reply::Disconnected;
-        }
-        Reply::Messages(Vec::new())
+/// 一次请求-响应：写一帧，收本次响应（0..n 条 update + 0..1 条 commit）。
+fn exchange(pipe: &mut Pipe, env: &Envelope, shared: &Shared) -> Reply {
+    let started = Instant::now();
+    // 上一键超时留下的迟到响应属于已经放行的按键，整批丢弃，不能混进本次响应。
+    pipe.drain();
+    let Ok(frame) = encode(env) else {
+        return Reply::Disconnected;
+    };
+    if pipe.write(&frame).is_err() {
+        return Reply::Disconnected;
     }
-
-    fn handle(&mut self, env: &Envelope, shared: &Shared) -> Reply {
-        let started = Instant::now();
-        if self.pipe.is_none() && !self.connect(shared) {
-            return Reply::Disconnected;
-        }
-        let mut messages = Vec::new();
-        {
-            let Some(pipe) = self.pipe.as_mut() else {
-                return Reply::Disconnected;
-            };
-            // 上一键超时留下的迟到响应属于已经放行的按键，这里整批丢弃，
-            // 不能混进本次响应（04：迟到响应一律丢弃）。
-            pipe.drain();
-            let Ok(frame) = encode(env) else {
-                return Reply::Disconnected;
-            };
-            if pipe.write(&frame).is_err() {
-                self.drop_pipe(shared);
-                return Reply::Disconnected;
-            }
-            loop {
-                let budget = KEY_TIMEOUT.saturating_sub(started.elapsed());
-                // 有 preedit 的 update 之后不会再有 commit；其余情况要收尾帧。
-                let wait = if messages.is_empty() {
-                    budget
-                } else {
-                    budget.min(TAIL_WAIT)
-                };
-                if wait.is_zero() {
-                    break;
-                }
-                let Ok(body) = pipe.recv(wait) else {
-                    break;
-                };
-                // 畸形帧说明流已错位（04：必须断开），交给外层重连。
-                let Ok(env) = decode(&body) else {
-                    self.drop_pipe(shared);
-                    return Reply::Disconnected;
-                };
-                let incoming = msg::parse_incoming(&env);
-                observe(&incoming, shared);
-                let last = match &incoming {
-                    Incoming::Update(update) => !update.preedit.is_empty(),
-                    _ => true,
-                };
-                messages.push(incoming);
-                if last {
-                    break;
-                }
-            }
-        }
-        if messages.is_empty() {
-            // 一条都没收到：host 超时，按降级处理。
+    match read_response(started, |wait| pipe.recv(wait), shared) {
+        // 一条都没收到：host 超时，按降级处理。
+        Ok(messages) if messages.is_empty() => {
             shared.failures.fetch_add(1, Ordering::Relaxed);
             Reply::Timeout
+        }
+        Ok(messages) => Reply::Messages(messages),
+        Err(()) => Reply::Disconnected,
+    }
+}
+
+/// 只发不收（caret/bye/ping）。
+fn post_only(pipe: &mut Pipe, env: &Envelope) -> Reply {
+    let Ok(frame) = encode(env) else {
+        return Reply::Disconnected;
+    };
+    if pipe.write(&frame).is_err() {
+        return Reply::Disconnected;
+    }
+    Reply::Messages(Vec::new())
+}
+
+/// 收一次响应。
+///
+/// 收尾语义（04:76「update 与 commit 允许同帧先后到达，按序应用」）：一个响应的
+/// 内容 = 0..n 条 update + 0..1 条 commit。收到 commit 即结束；否则收到首条消息
+/// 后再等 `TAIL_WAIT` 的静默期。有 preedit 的 update 之后仍可能有 commit，任何
+/// 消息都不能当作结束标志，否则会丢上屏。
+fn read_response(
+    started: Instant,
+    mut recv: impl FnMut(Duration) -> Result<Vec<u8>, ()>,
+    shared: &Shared,
+) -> Result<Vec<Incoming>, ()> {
+    let mut messages = Vec::new();
+    loop {
+        let budget = KEY_TIMEOUT.saturating_sub(started.elapsed());
+        if budget.is_zero() {
+            break;
+        }
+        let wait = if messages.is_empty() {
+            budget
         } else {
-            Reply::Messages(messages)
+            budget.min(TAIL_WAIT)
+        };
+        let Ok(body) = recv(wait) else {
+            // 超时即静默期结束；断连同样是结束，已有的消息照常返回。
+            break;
+        };
+        // 畸形帧说明流已错位（04：必须断开），交给外层重连。
+        let Ok(env) = decode(&body) else {
+            return Err(());
+        };
+        let incoming = msg::parse_incoming(&env);
+        observe(&incoming, shared);
+        let ends = matches!(incoming, Incoming::Commit(_));
+        messages.push(incoming);
+        if ends {
+            break;
         }
     }
+    Ok(messages)
+}
 
-    fn connect(&mut self, shared: &Shared) -> bool {
-        let Some(sid) = util::current_user_sid() else {
+/// 空闲保活：到点发一条 ping（04:72）。写失败返回错误，调用方丢弃连接。
+fn keepalive(pipe: &mut Option<Pipe>, last_tx: &mut Instant) -> std::io::Result<()> {
+    let Some(active) = pipe.as_mut() else {
+        return Ok(());
+    };
+    if last_tx.elapsed() < IDLE_PING {
+        return Ok(());
+    }
+    *last_tx = Instant::now();
+    let frame = encode(&msg::ping(now_ms())).map_err(|_| std::io::Error::other("ping 编码失败"))?;
+    active.write(&frame)
+}
+
+/// 单调毫秒时间戳，协议 `ts` 字段用。
+pub fn now_ms() -> u64 {
+    // SAFETY: GetTickCount64 无参数、无指针、无失败路径，只读系统计数器。
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+}
+
+/// 后台连接线程：收到建连请求才动手，成功后把连接交给 IO 线程。
+fn connector_loop(link: Arc<Link>, shared: Arc<Shared>) {
+    let mut spawns: Vec<Instant> = Vec::new();
+    let mut retry_at = Instant::now();
+    loop {
+        {
+            let mut state = link.state();
+            loop {
+                if state.stopping {
+                    return;
+                }
+                if state.wanted && Instant::now() >= retry_at {
+                    break;
+                }
+                let wait = if state.wanted {
+                    retry_at.saturating_duration_since(Instant::now())
+                } else {
+                    // 无请求时久等：唤醒只来自 request/stop。
+                    Duration::from_secs(5)
+                };
+                let (next, _) = link
+                    .wake
+                    .wait_timeout(state, wait)
+                    .unwrap_or_else(|e| e.into_inner());
+                state = next;
+            }
+            state.wanted = false;
+        }
+        match open_link(&shared, &mut spawns) {
+            Some(pipe) => link.publish(pipe),
+            // 失败后至少隔 1 s 再试：host 未安装时不让后台线程空转。
+            None => retry_at = Instant::now() + Duration::from_secs(1),
+        }
+    }
+}
+
+/// 建一条连接：先连已在跑的 host，没有就限速拉起再连。全程只在本线程上。
+fn open_link(shared: &Shared, spawns: &mut Vec<Instant>) -> Option<Pipe> {
+    let sid = util::current_user_sid()?;
+    let name = format!(r"\\.\pipe\silk-ime-{sid}");
+    let mut pipe = match Pipe::connect(&name) {
+        Ok(pipe) => pipe,
+        Err(_) => {
+            // 无人监听：按注册表安装目录拉起 host，限速 3 次/分钟。
+            spawns.retain(|t| t.elapsed() < SPAWN_WINDOW);
+            if spawns.len() >= SPAWN_BUDGET || !spawn_host() {
+                return None;
+            }
+            spawns.push(Instant::now());
+            let deadline = Instant::now() + SPAWN_WAIT;
+            loop {
+                if let Ok(pipe) = Pipe::connect(&name) {
+                    break pipe;
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    handshake(&mut pipe, shared).then_some(pipe)
+}
+
+/// 握手：发 `hello`，等 `welcome`（版本不匹配的 `error` 直接放弃）。
+fn handshake(pipe: &mut Pipe, shared: &Shared) -> bool {
+    let Ok(hello) = encode(&msg::hello()) else {
+        return false;
+    };
+    if pipe.write(&hello).is_err() {
+        return false;
+    }
+    let started = Instant::now();
+    loop {
+        let remaining = SPAWN_WAIT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return false;
+        }
+        let Ok(body) = pipe.recv(remaining) else {
             return false;
         };
-        let name = format!(r"\\.\pipe\silk-ime-{sid}");
-        if let Ok(pipe) = Pipe::connect(&name) {
-            return self.handshake(pipe, shared);
-        }
-        // 无人监听：按注册表安装目录拉起 host，限速 3 次/分钟。
-        self.spawns.retain(|t| t.elapsed() < SPAWN_WINDOW);
-        if self.spawns.len() >= SPAWN_BUDGET {
-            return false;
-        }
-        self.spawns.push(Instant::now());
-        if !spawn_host() {
-            return false;
-        }
-        let deadline = Instant::now() + SPAWN_WAIT;
-        while Instant::now() < deadline {
-            if let Ok(pipe) = Pipe::connect(&name) {
-                return self.handshake(pipe, shared);
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        false
-    }
-
-    fn handshake(&mut self, mut pipe: Pipe, shared: &Shared) -> bool {
-        let Ok(hello) = encode(&msg::hello()) else {
+        let Ok(env) = decode(&body) else {
             return false;
         };
-        if pipe.write(&hello).is_err() {
+        let incoming = msg::parse_incoming(&env);
+        if let Incoming::Welcome(cfg) = &incoming {
+            shared.page_size.store(cfg.page_size.max(1), Ordering::Relaxed);
+            shared.set_mode(cfg.chinese, cfg.full_punct);
+            shared.connected.store(true, Ordering::Relaxed);
+            shared.failures.store(0, Ordering::Relaxed);
+            return true;
+        }
+        // welcome 之前的别的消息只可能是 error：版本不匹配即放弃连接。
+        if matches!(incoming, Incoming::Error { .. }) {
             return false;
         }
-        let started = Instant::now();
-        loop {
-            let remaining = SPAWN_WAIT.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return false;
-            }
-            let Ok(body) = pipe.recv(remaining) else {
-                return false;
-            };
-            let Ok(env) = decode(&body) else {
-                return false;
-            };
-            let incoming = msg::parse_incoming(&env);
-            if let Incoming::Welcome(cfg) = &incoming {
-                shared.page_size.store(cfg.page_size.max(1), Ordering::Relaxed);
-                shared.set_mode(cfg.chinese, cfg.full_punct);
-                self.pipe = Some(pipe);
-                shared.connected.store(true, Ordering::Relaxed);
-                shared.failures.store(0, Ordering::Relaxed);
-                return true;
-            }
-            // welcome 之前的别的消息只可能是 error：版本不匹配即放弃连接。
-            if matches!(incoming, Incoming::Error { .. }) {
-                return false;
-            }
-        }
-    }
-
-    fn drop_pipe(&mut self, shared: &Shared) {
-        self.pipe = None;
-        shared.connected.store(false, Ordering::Relaxed);
-        shared.failures.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -385,6 +625,8 @@ fn spawn_host() -> bool {
         ..Default::default()
     };
     let mut info = PROCESS_INFORMATION::default();
+    // SAFETY: cmdline 是可写 UTF-16 缓冲（CreateProcessW 只原地改写它），生命周期
+    // 覆盖调用；startup/info 是栈上独有的可写结构；句柄不继承（false）。
     let ok = unsafe {
         CreateProcessW(
             PCWSTR::null(),
@@ -402,6 +644,8 @@ fn spawn_host() -> bool {
     if ok.is_err() {
         return false;
     }
+    // SAFETY: 两个句柄刚由 CreateProcessW 填写、尚未转交别人；本进程不需要它们，
+    // 关掉即释放引用（host 进程本身继续运行）。
     unsafe {
         let _ = CloseHandle(info.hProcess);
         let _ = CloseHandle(info.hThread);
@@ -418,10 +662,11 @@ struct Op {
     ov: OVERLAPPED,
     event: HANDLE,
 }
-
 impl Op {
     fn new() -> std::io::Result<Op> {
         // 每个操作独立一份事件：读写并发时不共享信号，取消也只针对本操作。
+        // SAFETY: CreateEventW 只返回新句柄，参数均为标量；失败走 Err 分支，
+        // 不会留下半初始化状态。
         let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
             .map_err(|_| std::io::Error::other("事件创建失败"))?;
         Ok(Op {
@@ -436,8 +681,11 @@ impl Op {
 
 impl Drop for Op {
     fn drop(&mut self) {
-        // 安全前提：调用方已通过 settle、或提交即失败/已完成，保证内核不再引用。
-        unsafe { let _ = CloseHandle(self.event); }
+        // SAFETY: 句柄由 Op::new 独占创建，Drop 是唯一释放点；调用方保证已通过
+        // settle（或提交即刻失败/完成），内核不再引用 OVERLAPPED。
+        unsafe {
+            let _ = CloseHandle(self.event);
+        }
     }
 }
 
@@ -449,6 +697,8 @@ fn win32_code(err: &windows::core::Error) -> u32 {
 /// 取已完成操作的结果。
 fn result(handle: HANDLE, op: &Op) -> std::io::Result<u32> {
     let mut done = 0u32;
+    // SAFETY: handle 是本次操作提交时用的同一句柄，op.ov 提交后未移动、且调用方
+    // 只在事件已置位后进来，done 是本地可写量。
     unsafe { GetOverlappedResult(handle, &op.ov, &mut done, false) }
         .map(|()| done)
         .map_err(|_| std::io::Error::other("管道 I/O 失败"))
@@ -456,10 +706,17 @@ fn result(handle: HANDLE, op: &Op) -> std::io::Result<u32> {
 
 /// 取消未完成的操作并**等内核放手**：OVERLAPPED 与缓冲区在之前释放就是 UAF。
 fn abort(handle: HANDLE, op: &Op) {
-    unsafe { let _ = CancelIoEx(handle, Some(&op.ov)); }
+    // SAFETY: CancelIoEx 只标记取消，不访问 OVERLAPPED 之外的资源；op 由调用方
+    // 保证活到本函数返回。
+    unsafe {
+        let _ = CancelIoEx(handle, Some(&op.ov));
+    }
     let mut done = 0u32;
     // 取消请求可能失败（操作恰好已完成），此时这里立即返回。
-    unsafe { let _ = GetOverlappedResult(handle, &op.ov, &mut done, true); }
+    // SAFETY: 阻塞等待到内核真正放手，之后调用方才会释放 OVERLAPPED 与缓冲区。
+    unsafe {
+        let _ = GetOverlappedResult(handle, &op.ov, &mut done, true);
+    }
 }
 
 /// 等已排队的操作完成。
@@ -473,6 +730,7 @@ fn settle(
     stopping: Option<&AtomicBool>,
 ) -> std::io::Result<u32> {
     loop {
+        // SAFETY: op.event 是 Op::new 创建的有效事件句柄，本函数独占等待它。
         if unsafe { WaitForSingleObject(op.event, WAIT_SLICE_MS) } == WAIT_OBJECT_0 {
             return result(handle, op);
         }
@@ -497,7 +755,12 @@ fn overlapped_read(
     buf: &mut [u8],
     stopping: &AtomicBool,
 ) -> std::io::Result<u32> {
-    unsafe { let _ = ResetEvent(op.event); }
+    // SAFETY: op.event 有效且当前无等待者；重置只是清掉上一次的信号。
+    unsafe {
+        let _ = ResetEvent(op.event);
+    }
+    // SAFETY: handle 是重叠模式管道句柄；buf 由调用方保证活到本函数返回；OVERLAPPED
+    // 与事件归 op 所有、提交后不移动；内核在完成（或 abort 等到的取消）前一直引用两者。
     match unsafe { ReadFile(handle, Some(buf), None, Some(&mut op.ov)) } {
         Ok(()) => result(handle, op),
         Err(err) if win32_code(&err) == ERROR_IO_PENDING.0 => {
@@ -514,7 +777,12 @@ fn overlapped_write(
     bytes: &[u8],
     timeout: Duration,
 ) -> std::io::Result<u32> {
-    unsafe { let _ = ResetEvent(op.event); }
+    // SAFETY: 同 overlapped_read：事件有效、当前无等待者。
+    unsafe {
+        let _ = ResetEvent(op.event);
+    }
+    // SAFETY: handle 是重叠模式管道句柄；bytes 是本次调用独占的只读切片，内核只在
+    // 完成前引用它；OVERLAPPED 与事件归 op 所有，settle 返回前不释放。
     match unsafe { WriteFile(handle, Some(bytes), None, Some(&mut op.ov)) } {
         Ok(()) => result(handle, op),
         Err(err) if win32_code(&err) == ERROR_IO_PENDING.0 => {
@@ -541,6 +809,8 @@ impl Pipe {
         let path = PCWSTR(namez.as_ptr());
         let deadline = Instant::now() + SPAWN_WAIT;
         let handle = loop {
+            // SAFETY: namez 是 NUL 结尾的 UTF-16 且活到本函数返回；安全属性为 None
+            // （默认 ACL）；返回的句柄由下面接管并最终在 Drop 里关闭。
             let result = unsafe {
                 CreateFileW(
                     path,
@@ -560,6 +830,7 @@ impl Pipe {
                 Err(err) => {
                     let busy = win32_code(&err) == ERROR_PIPE_BUSY.0;
                     if busy && Instant::now() < deadline {
+                        // SAFETY: path 与上面同一份存活缓冲，超时值只是毫秒数。
                         unsafe {
                             let _ = WaitNamedPipeW(path, 20);
                         }
@@ -573,19 +844,24 @@ impl Pipe {
         let writer = match Op::new() {
             Ok(op) => op,
             Err(err) => {
-                unsafe { let _ = CloseHandle(handle); }
+                // SAFETY: handle 尚未交给任何结构，本条分支是唯一所有者。
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
                 return Err(err);
             }
         };
         let (tx, frames) = mpsc::channel();
         let stopping = Arc::new(AtomicBool::new(false));
         let reader_stop = Arc::clone(&stopping);
-        // HANDLE 不是 Send；所有权仍归本 Pipe（Drop 先取消再关句柄、并等读线程
-        // 退出），读线程只借用这个值调用内核。
+        // HANDLE 不是 Send，转成裸值跨线程传：所有权仍归本 Pipe，读线程只借用它
+        // 调内核；Pipe::drop 先置停止标志并 CancelIoEx、join 读线程之后才关句柄。
         let raw = handle.0 as usize;
         let spawned = std::thread::Builder::new()
             .name("silk-ipc-read".to_owned())
             .spawn(move || {
+                // SAFETY: 句柄值由 Pipe::connect 所有权移交而来，读线程与 Pipe 的
+                // 生命周期由 join 保证不重叠。
                 let handle = HANDLE(raw as *mut core::ffi::c_void);
                 read_loop(handle, tx, reader_stop);
             });
@@ -598,29 +874,25 @@ impl Pipe {
                 stopping,
             }),
             Err(_) => {
-                unsafe { let _ = CloseHandle(handle); }
+                // SAFETY: 线程没建成，句柄仍只属于本函数。
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
                 Err(std::io::Error::other("读线程创建失败"))
             }
         }
     }
 
-    /// 写一帧（含长度前缀）。
+    /// 写一帧（含长度前缀），整帧一次写。
     ///
-    /// 头与体必须分两条消息写：消息模式管道在接收方缓冲不足时会丢弃消息余部，
-    /// 而 host 的 ReadFrame 先按 4 字节读头，所以帧体必须是下一条独立消息
-    /// （与 Go 侧 WriteFrame 的两段写一一对应）。
+    /// 传输是字节模式 + 长度前缀自定界（04「传输层」）：接收方按前缀重组，不依赖
+    /// 写边界，所以不再分两段写（Go 侧 `ipc.WriteFrame` 同样是整帧单次写）。
     fn write(&mut self, frame: &[u8]) -> std::io::Result<()> {
         if frame.len() < 4 {
             return Err(std::io::Error::other("帧短于长度前缀"));
         }
-        let (header, body) = frame.split_at(4);
-        self.write_message(header)?;
-        self.write_message(body)
-    }
-
-    fn write_message(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        let written = overlapped_write(self.handle, &mut self.writer, bytes, WRITE_TIMEOUT)?;
-        if written as usize != bytes.len() {
+        let written = overlapped_write(self.handle, &mut self.writer, frame, WRITE_TIMEOUT)?;
+        if written as usize != frame.len() {
             return Err(std::io::Error::other("管道短写"));
         }
         Ok(())
@@ -629,6 +901,11 @@ impl Pipe {
     /// 取一整帧（含 4 字节长度前缀）。超时或断连返回 Err。
     fn recv(&self, timeout: Duration) -> Result<Vec<u8>, ()> {
         self.frames.recv_timeout(timeout).map_err(|_| ())
+    }
+
+    /// 读线程已退出（对端关闭或流错位）：连接不可再用。
+    fn closed(&self) -> bool {
+        self.reader.as_ref().map_or(true, |reader| reader.is_finished())
     }
 
     /// 丢弃已经到达的所有帧。
@@ -640,14 +917,19 @@ impl Pipe {
 impl Drop for Pipe {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
-        // 读线程可能正在等事件：取消句柄上所有挂起的重叠操作把它唤醒。
-        // 读线程自己也会在切片等待里看到停止标志，因此带宽上界只是切片时长。
-        unsafe { let _ = CancelIoEx(self.handle, None); }
+        // SAFETY: 句柄在 join 之前一直有效；取消本句柄上所有挂起的重叠操作，
+        // 唤醒可能正阻塞在读线程里的 ReadFile。
+        unsafe {
+            let _ = CancelIoEx(self.handle, None);
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
-        // 读线程已退出，句柄不再被任何人调用；关句柄即释放连接。
-        unsafe { let _ = CloseHandle(self.handle); }
+        // SAFETY: 读线程已 join，write 侧只有本线程在用；此刻没有其他调用者，
+        // 关句柄即释放连接。
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
     }
 }
 
@@ -662,6 +944,8 @@ fn read_loop(handle: HANDLE, tx: Sender<Vec<u8>>, stopping: Arc<AtomicBool>) {
         if stopping.load(Ordering::Acquire) {
             return;
         }
+        // 句柄所有权归 Pipe：Pipe::drop 会先置停止标志、CancelIoEx，再 join 本线程，
+        // 因此这里拿到的一定是仍有效的句柄。
         let Ok(read) = overlapped_read(handle, &mut op, &mut buf, &stopping) else {
             return;
         };
@@ -727,9 +1011,26 @@ mod tests {
         let client = Client::new();
         let started = Instant::now();
         let reply = client.request(&crate::msg::hello(), true, Duration::from_millis(15));
-        assert!(matches!(reply, Reply::Timeout | Reply::Disconnected));
-        // 本机若有 host 在跑，15 ms 预算也必须守住。
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // 本机没有 host 时是 Timeout/Disconnected；有 host 时 15 ms 内连上属正常。
+        assert!(!matches!(reply, Reply::Messages(ref m) if m.is_empty()));
+        assert!(started.elapsed() < Duration::from_secs(2), "15 ms 预算未守住");
+    }
+
+    #[test]
+    fn request_never_waits_for_connection_setup() {
+        // 03:83：连接建立（CreateProcess + 等 welcome，上限 2 s）在后台线程，回调
+        // 路径只等 15 ms 的响应预算，因此冷启动时首次请求也必须立刻返回。
+        let client = Client::new();
+        let started = Instant::now();
+        for _ in 0..3 {
+            // 本机可能已有 host 在跑（返回 Messages 也算通过），关键是耗时。
+            let _ = client.request(&crate::msg::hello(), true, KEY_TIMEOUT);
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "冷启动请求不应等待建连：耗时 {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -758,7 +1059,71 @@ mod tests {
         assert!(shared.mode().chinese);
     }
 
+    /// 收包收尾的语义：commit 才结束响应，update 不能当结束标志（04:76）。
+    fn response_from(frames: Vec<Envelope>) -> Result<Vec<Incoming>, ()> {
+        let shared = Shared::new();
+        let mut queue: VecDeque<Vec<u8>> = frames
+            .iter()
+            .map(|env| encode(env).expect("测试封套应可编码"))
+            .collect();
+        read_response(
+            Instant::now(),
+            move |_| queue.pop_front().ok_or(()),
+            &shared,
+        )
+    }
+
+    fn update_env(preedit: &str) -> Envelope {
+        Envelope {
+            v: silk_protocol::VERSION,
+            id: 0,
+            type_: silk_protocol::TYPE_UPDATE.to_owned(),
+            sid: Some("s-1".to_owned()),
+            payload: serde_json::json!({
+                "preedit": preedit,
+                "caret": preedit.chars().count(),
+                "candidates": [],
+                "page_index": 0,
+                "mode": {"chinese": true, "full_punct": true},
+            }),
+        }
+    }
+
+    fn commit_env(text: &str) -> Envelope {
+        Envelope {
+            v: silk_protocol::VERSION,
+            id: 0,
+            type_: silk_protocol::TYPE_COMMIT.to_owned(),
+            sid: Some("s-1".to_owned()),
+            payload: serde_json::json!({ "text": text }),
+        }
+    }
+
+    #[test]
+    fn update_with_preedit_keeps_following_commit() {
+        // 同一响应里 update(preedit) 之后还有 commit：把它当结束标志就会丢上屏。
+        let messages =
+            response_from(vec![update_env("hao"), commit_env("好")]).expect("应收到响应");
+        assert_eq!(messages.len(), 2, "update 与 commit 都必须到达");
+        assert!(matches!(messages[0], Incoming::Update(_)));
+        assert_eq!(messages[1], Incoming::Commit("好".to_owned()));
+    }
+
+    #[test]
+    fn commit_ends_response() {
+        let messages =
+            response_from(vec![commit_env("好"), update_env("不该被读到")]).expect("应收到响应");
+        assert_eq!(messages.len(), 1, "commit 之后不再收");
+        assert!(matches!(messages[0], Incoming::Commit(_)));
+    }
+
+    #[test]
+    fn empty_queue_yields_empty_response() {
+        assert!(response_from(Vec::new()).expect("空响应不算断连").is_empty());
+    }
+
 }
+
 
 /// 端到端联调检查：需要先手工起 silkhost.exe（不改用默认管道名以外的路径）。
 ///

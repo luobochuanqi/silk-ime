@@ -23,7 +23,8 @@ var (
 // WriteFrame 将一整帧（Encode 的产物）写入 w，整帧单次写入。
 //
 // 帧自带 u32 长度前缀；写前校验前缀完整性，不匹配视为编程错误。
-// 必须单次 Write：消息模式管道按写分消息，分次写会劈开帧边界。w 的错误经 %w 包装后返回。
+// 整帧单次 Write：该约束与传输模式无关（消息模式按写分消息会劈开帧，
+// 字节模式下也避免中间态）。w 的错误经 %w 包装后返回。
 func WriteFrame(w io.Writer, frame []byte) error {
 	if len(frame) < 4 {
 		return fmt.Errorf("%w: 帧短于长度前缀", ErrInvalidMessage)

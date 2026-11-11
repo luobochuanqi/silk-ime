@@ -59,10 +59,12 @@ impl IClassFactory_Impl for Factory_Impl {
         }
         let unknown: IUnknown = tip::Tip::new().into();
         let mut out = core::ptr::null_mut();
+        // SAFETY: riid 非空（上面判过）且由 COM 保证指向合法 IID；out 是本地可写量。
         let hr = unsafe { unknown.query(riid, &mut out) };
         if hr.is_err() {
             return Err(windows::core::Error::from_hresult(E_NOINTERFACE));
         }
+        // SAFETY: object 非空（上面判过），按 COM 契约可写；out 是刚取得的接口指针。
         unsafe { *object = out };
         Ok(())
     }
@@ -85,11 +87,16 @@ pub unsafe extern "system" fn DllGetClassObject(
     if rclsid.is_null() || riid.is_null() || object.is_null() {
         return E_POINTER;
     }
-    unsafe { *object = core::ptr::null_mut() };
-    if unsafe { *rclsid } != reg::CLSID_SILK_TIP {
-        return CLASS_E_CLASSNOTAVAILABLE;
+    // SAFETY: 三个指针由 COM 保证有效可写（已判空）；读 rclsid 与写 *object 都在
+    // 契约范围内，且 object 先置空以便失败时调用方拿到确定的空指针。
+    unsafe {
+        *object = core::ptr::null_mut();
+        if *rclsid != reg::CLSID_SILK_TIP {
+            return CLASS_E_CLASSNOTAVAILABLE;
+        }
     }
     let factory: IClassFactory = Factory.into();
+    // SAFETY: riid/object 同上；query 只写 *object。
     unsafe { factory.query(riid, object) }
 }
 
@@ -114,7 +121,9 @@ pub unsafe extern "system" fn SilkRegister(
     cmd: *const u8,
     _show: i32,
 ) {
-    reg::run_register(unsafe { reg::cmd_arg(cmd) }.as_deref());
+    // SAFETY: cmd 按 rundll32 契约是 NUL 结尾的 ANSI 串或空指针，cmd_arg 自己判空。
+    let scope = unsafe { reg::cmd_arg(cmd) };
+    reg::run_register(scope.as_deref());
 }
 
 /// 注销入口，逆序清理三类注册。
@@ -128,7 +137,9 @@ pub unsafe extern "system" fn SilkUnregister(
     cmd: *const u8,
     _show: i32,
 ) {
-    reg::run_unregister(unsafe { reg::cmd_arg(cmd) }.as_deref());
+    // SAFETY: 同 SilkRegister。
+    let scope = unsafe { reg::cmd_arg(cmd) };
+    reg::run_unregister(scope.as_deref());
 }
 
 /// 补登记：把已有 profile 重新启用进当前用户键盘列表。

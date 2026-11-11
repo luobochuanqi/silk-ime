@@ -176,7 +176,7 @@ impl Gpu {
                 let _ = swap2.SetMaximumFrameLatency(1);
             }
         }
-        let _ = factory;
+        drop(factory); // 交换链建好后立即释放工厂，缩小 COM 对象持有窗口
 
         let mut gpu = Self {
             device,
@@ -247,7 +247,6 @@ impl Gpu {
         theme: &Theme,
         params: &IDWriteRenderingParams,
     ) -> Result<()> {
-        let _ = &self.device;
         // SAFETY: 目标处于可绘制状态（上一帧 EndDraw 已完成）。
         unsafe {
             self.context.BeginDraw();

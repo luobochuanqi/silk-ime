@@ -12,7 +12,7 @@ use windows::Win32::UI::TextServices::{
     ITfDisplayAttributeInfo, ITfDisplayAttributeInfo_Impl, ITfDisplayAttributeProvider,
     ITfDisplayAttributeProvider_Impl, ITfDocumentMgr, ITfUIElement, ITfUIElement_Impl,
     ITfUIElementMgr, TF_CLUIE_COUNT, TF_CLUIE_CURRENTPAGE, TF_CLUIE_DOCUMENTMGR,
-    TF_CLUIE_SELECTION, TF_CLUIE_STRING, TF_CT_NONE, TF_DA_LINESTYLE, TF_DA_ATTR_INFO,
+    TF_CLUIE_SELECTION, TF_CLUIE_STRING, TF_CT_NONE,
     TF_LS_SOLID, TF_ATTR_INPUT, TF_DA_COLOR, TF_DISPLAYATTRIBUTE,
 };
 
@@ -113,6 +113,8 @@ impl ITfCandidateListUIElement_Impl for CandidateElement_Impl {
         let view = self.view();
         let size = view.page_size.max(1);
         let pages = (view.candidates.len() as u32).div_ceil(size);
+        // SAFETY: TSF 传进来的两个指针按接口契约有效：page_count 可写 1 个 u32，
+        // index 数组有 capacity 个 u32；写入数量取 capacity.min(pages)，不越界。
         unsafe {
             *page_count = pages;
             for page in 0..capacity.min(pages) {
@@ -160,6 +162,7 @@ pub fn sync(session: &Arc<Session>, ctx: &ITfContext) {
         Some((id, shared)) => {
             // 宿主已持有元素指针：换掉共享快照再通知刷新，避免 End+Begins 闪烁。
             *shared.lock().unwrap_or_else(|e| e.into_inner()) = view;
+            // SAFETY: mgr 由当前 context 取得；id 来自成功的 BeginUIElement。
             let _ = unsafe { mgr.UpdateUIElement(id) };
         }
         None => {
@@ -177,6 +180,8 @@ pub fn sync(session: &Arc<Session>, ctx: &ITfContext) {
             let ui: ITfUIElement = list.into();
             let mut show = windows::core::BOOL::from(shown);
             let mut id = 0u32;
+            // SAFETY: mgr 有效；ui 是本站对象的接口引用，TSF 会持有它到 EndUIElement；
+            // show/id 是本地可写量。
             if unsafe { mgr.BeginUIElement(&ui, &mut show, &mut id) }.is_ok() {
                 let mut state = session.lock();
                 state.ui_id = Some(id);
@@ -198,6 +203,7 @@ pub fn end(session: &Arc<Session>, ctx: &ITfContext) {
         state.ui_id.take()
     };
     if let Some(id) = id {
+        // SAFETY: mgr 有效；id 是本会话登记且尚未结束的那一个。
         let _: windows::core::Result<()> = unsafe { mgr.EndUIElement(id) };
     }
     session.lock().shown = false;
@@ -232,9 +238,8 @@ impl ITfDisplayAttributeInfo_Impl for DisplayAttribute_Impl {
             crLine: none,
             bAttr: TF_ATTR_INPUT,
         };
+        // SAFETY: info 非空（上面判过），按接口契约指向调用方可写的 1 个结构。
         unsafe { info.write(value) };
-        let _ = TF_DA_LINESTYLE(0);
-        let _ = TF_DA_ATTR_INFO(0);
         Ok(())
     }
 
@@ -259,6 +264,7 @@ impl ITfDisplayAttributeProvider_Impl for DisplayAttributeProvider_Impl {
     }
 
     fn GetDisplayAttributeInfo(&self, guid: *const GUID) -> Result<ITfDisplayAttributeInfo> {
+        // SAFETY: guid 由 TSF 按接口契约传入；非空才解引用。
         if guid.is_null() || unsafe { *guid } != GUID_SILK_DISPLAY_ATTRIBUTE {
             return Err(windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG));
         }
@@ -269,6 +275,7 @@ impl ITfDisplayAttributeProvider_Impl for DisplayAttributeProvider_Impl {
 
 /// 把显示属性登记进类别管理器；值是指向本类的 GUID 原子，供属性值引用。
 pub fn register_display_attribute() -> bool {
+    // SAFETY: CoCreateInstance 只返回新接口指针；参数为静态 CLSID 与进程内服务器。
     let mgr: Result<ITfCategoryMgr> = unsafe {
         windows::Win32::System::Com::CoCreateInstance(
             &windows::Win32::UI::TextServices::CLSID_TF_CategoryMgr,
@@ -279,6 +286,7 @@ pub fn register_display_attribute() -> bool {
     let Ok(mgr) = mgr else {
         return false;
     };
+    // SAFETY: mgr 有效；GUID/CLSID 均为静态常量，两个调用只读写 TSF 自己的注册表。
     unsafe {
         mgr.RegisterGUID(&GUID_SILK_DISPLAY_ATTRIBUTE).is_ok()
             && mgr

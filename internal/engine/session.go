@@ -30,10 +30,11 @@ type Engine struct {
 
 // Session 是一个文档的输入状态。非并发安全，由调用方保证串行调用。
 type Session struct {
-	e     *Engine
-	mode  Mode
-	input []rune
-	page  int
+	e      *Engine
+	mode   Mode
+	input  []rune
+	page   int
+	lastTs int64
 	// 成对标点栈保存尚未闭合的右半字符；跨上屏保留，随会话重建而清空。
 	pairs []rune
 
@@ -172,10 +173,11 @@ func (s *Session) Handle(ev Event) Response {
 	case ev.Toggle != nil:
 		return s.toggle(*ev.Toggle)
 	case ev.Select != nil:
-		return s.selectAt(*ev.Select, 0)
+		return s.selectAt(*ev.Select, s.lastTs)
 	case ev.Page != nil:
 		return s.turnPage(*ev.Page)
 	case ev.Key != nil:
+		s.lastTs = int64(ev.Key.TS)
 		return s.key(*ev.Key)
 	}
 	return s.view()

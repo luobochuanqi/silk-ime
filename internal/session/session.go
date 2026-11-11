@@ -1,12 +1,14 @@
 // Package session 管理输入会话：焦点进出、事件路由与用户词频落盘。
 //
 // 会话状态的所有权在 Manager：每个会话由单一 goroutine（连接读循环）串行调用，
-// 会话内互斥锁用于隔离未来多文档并发；引擎本身无共享可变状态（见 05 设计）。
+// 会话内互斥锁用于隔离未来多文档并发；引擎的可变状态（用户词频增量）由引擎内部同步。
 package session
 
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/luobochuanqi/silk-ime/internal/engine"
 )
@@ -18,6 +20,7 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
+	lastUse  atomic.Int64
 }
 
 type session struct {
@@ -27,11 +30,30 @@ type session struct {
 
 // NewManager 创建管理器；userPath 为空表示不落盘用户词频（测试用）。
 func NewManager(eng *engine.Engine, userPath string) *Manager {
-	return &Manager{eng: eng, userPath: userPath, sessions: make(map[string]*session)}
+	m := &Manager{eng: eng, userPath: userPath, sessions: make(map[string]*session)}
+	m.lastUse.Store(time.Now().UnixNano())
+	return m
+}
+
+// ActiveSessions 返回当前活动会话数（04：空闲自退出的判定依据）。
+func (m *Manager) ActiveSessions() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions)
+}
+
+// LastUse 返回最近一次会话活动的时间。
+func (m *Manager) LastUse() time.Time {
+	return time.Unix(0, m.lastUse.Load())
+}
+
+func (m *Manager) touch() {
+	m.lastUse.Store(time.Now().UnixNano())
 }
 
 // FocusIn 为新文档创建会话；同 sid 重复进入时重建（以新文档状态为准）。
 func (m *Manager) FocusIn(sid, app string) {
+	m.touch()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sessions[sid] = &session{s: m.eng.NewSession(engine.SessionMeta{App: app})}
@@ -74,6 +96,7 @@ func (m *Manager) Toggle(sid string, mode engine.Mode) (engine.Response, error) 
 }
 
 func (m *Manager) dispatch(sid string, ev engine.Event) (engine.Response, error) {
+	m.touch()
 	m.mu.Lock()
 	s, ok := m.sessions[sid]
 	m.mu.Unlock()

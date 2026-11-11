@@ -58,6 +58,8 @@ pub fn mods_from_state(shift: bool, ctrl: bool, alt: bool) -> u8 {
 
 /// 读当前按键状态；TSF 回调线程是宿主 UI 线程，可以直接取同步状态。
 pub fn current_mods() -> u8 {
+    // SAFETY: GetKeyState 只按 VK 读线程的同步按键状态，无指针参数、无失败路径；
+    // TSF 回调就在宿主 UI 线程上，状态与正在处理的按键一致。
     let pressed = |vk: VIRTUAL_KEY| unsafe { GetKeyState(vk.0 as i32) < 0 };
     mods_from_state(
         pressed(VK_SHIFT),
@@ -148,6 +150,37 @@ pub fn should_consume(preedit: &str, commit: &str, had_composition: bool, code: 
     }
     had_composition
         && matches!(code, KEY_ESC | KEY_BACKSPACE | KEY_PAGE_UP | KEY_PAGE_DOWN)
+}
+
+/// 每个虚拟键「按下时是否被吞」的记账，供抬起时复用同一决定。
+///
+/// 04:112 要求拿不准就放行：TestKeyUp 若按当前模式重新判定，会在「按下被吞、
+/// 期间模式或组合状态变了」时放走孤儿 KeyUp，反之则吞掉本不该吞的抬起。记住
+/// 按下时的实际结果，抬起照抄即可。
+#[derive(Debug)]
+pub struct EatenKeys {
+    slots: [bool; 256],
+}
+
+// 超过 32 元素的数组没有 Default 派生（MSRV 1.74），手写一份全 false。
+impl Default for EatenKeys {
+    fn default() -> EatenKeys {
+        EatenKeys { slots: [false; 256] }
+    }
+}
+
+impl EatenKeys {
+    pub fn remember(&mut self, vk: u16, eaten: bool) {
+        if let Some(slot) = self.slots.get_mut(vk as usize) {
+            *slot = eaten;
+        }
+    }
+
+    /// 按下时的处置结果（抬起要在 Test 与 Do 两个回调里给出同一答案）。
+    pub fn peek(&self, vk: u16) -> bool {
+        self.slots.get(vk as usize).copied().unwrap_or(false)
+    }
+
 }
 
 /// Shift 单键轻按（按下后未插入其他键即抬起）用于中英切换。
@@ -270,6 +303,22 @@ mod tests {
         assert!(should_consume("", "", true, KEY_BACKSPACE));
         assert!(!should_consume("", "", true, KEY_A));
         assert!(!should_consume("", "", false, KEY_ESC));
+    }
+
+    #[test]
+    fn eaten_keys_mirror_the_press() {
+        let mut keys = EatenKeys::default();
+        // 没按过的键抬起一律放行（拿不准就放行）。
+        assert!(!keys.peek(VK_A.0));
+        // 按下被吞 → 抬起被吞。
+        keys.remember(VK_A.0, true);
+        assert!(keys.peek(VK_A.0));
+        // 抬起处理完清账，下一次同键不再被吞。
+        keys.remember(VK_A.0, false);
+        assert!(!keys.peek(VK_A.0));
+        // 按下放行的键，抬起也放行。
+        keys.remember(VK_SPACE.0, false);
+        assert!(!keys.peek(VK_SPACE.0));
     }
 
     #[test]

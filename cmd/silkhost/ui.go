@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -63,6 +64,15 @@ func loadCandidateWindow() (*candidateWindow, error) {
 	return nil, fmt.Errorf("解析 silkui 导出: %w", err)
 }
 
+// cstr 返回 UTF-8 NUL 结尾的 C 字符串指针；内嵌 NUL 时截断（FFI 契约要求 C 字符串）。
+func cstr(s string) *byte {
+	if i := strings.IndexByte(s, 0); i >= 0 {
+		s = s[:i]
+	}
+	p, _ := syscall.BytePtrFromString(s) // 截断后不含 NUL，不会失败
+	return p
+}
+
 // render 显示/刷新候选窗；preedit 与候选内容在调用内拷贝进渲染库。
 func (w *candidateWindow) render(preedit string, candidates []candidateMsg, pageIndex int, anchor silkRect, owner uintptr) {
 	if w == nil {
@@ -70,11 +80,9 @@ func (w *candidateWindow) render(preedit string, candidates []candidateMsg, page
 	}
 	cands := make([]silkCandidate, len(candidates))
 	for i, c := range candidates {
-		text, _ := syscall.BytePtrFromString(c.Text)
-		comment, _ := syscall.BytePtrFromString(c.Comment)
-		cands[i] = silkCandidate{text: text, comment: comment}
+		cands[i] = silkCandidate{text: cstr(c.Text), comment: cstr(c.Comment)}
 	}
-	pre, _ := syscall.BytePtrFromString(preedit)
+	pre := cstr(preedit)
 	view := silkView{preedit: pre, candidates: unsafe.SliceData(cands), count: int32(len(cands)), pageIndex: int32(pageIndex)}
 	syscall.SyscallN(w.show, uintptr(unsafe.Pointer(&view)), uintptr(unsafe.Pointer(&anchor)), owner)
 	runtime.KeepAlive(cands)

@@ -102,6 +102,7 @@ type conn struct {
 	handshaked bool
 	owner      uintptr
 	anchor     silkRect
+	shown      bool
 }
 
 func (c *conn) send(typ, sid string, payload any) error {
@@ -109,7 +110,7 @@ func (c *conn) send(typ, sid string, payload any) error {
 	if err != nil {
 		return fmt.Errorf("编码载荷 %s: %w", typ, err)
 	}
-	env := ipc.Envelope{V: 1, Type: typ, SID: sid, Payload: raw}
+	env := ipc.Envelope{V: ipc.Version, Type: typ, SID: sid, Payload: raw}
 	body, err := ipc.Encode(env)
 	if err != nil {
 		return fmt.Errorf("编码信封 %s: %w", typ, err)
@@ -118,7 +119,9 @@ func (c *conn) send(typ, sid string, payload any) error {
 }
 
 func (c *conn) sendError(sid string, id uint64, code int, msg string) {
-	_ = c.send("error", sid, errMsg{ID: id, Code: code, Msg: msg})
+	if err := c.send("error", sid, errMsg{ID: id, Code: code, Msg: msg}); err != nil {
+		log.Printf("发送 error: %v", err)
+	}
 }
 
 // run 服务一条连接直到断开或协议违规（畸形帧直接断开，见 04 安全策略）。
@@ -138,7 +141,6 @@ func (c *conn) run() {
 			c.sendError(env.SID, env.ID, 400, "未握手")
 			return
 		}
-		log.Printf("收到 %s", env.Type)
 		if !c.dispatch(env) {
 			return
 		}
@@ -150,12 +152,14 @@ func (c *conn) dispatch(env ipc.Envelope) bool {
 	switch env.Type {
 	case "hello":
 		var msg helloMsg
-		if err := json.Unmarshal(env.Payload, &msg); err != nil || msg.V != 1 {
+		if err := json.Unmarshal(env.Payload, &msg); err != nil || msg.V != ipc.Version {
 			c.sendError(env.SID, env.ID, 400, "hello 版本不支持")
 			return false
 		}
 		c.handshaked = true
-		_ = c.send("welcome", "", welcomeMsg{V: 1, Cfg: c.snapshot})
+		if err := c.send("welcome", "", welcomeMsg{V: ipc.Version, Cfg: c.snapshot}); err != nil {
+			log.Printf("发送 welcome: %v", err)
+		}
 
 	case "focus_in":
 		var msg focusInMsg
@@ -174,6 +178,10 @@ func (c *conn) dispatch(env ipc.Envelope) bool {
 			return true
 		}
 		c.anchor = silkRect{x: msg.Rect.X, y: msg.Rect.Y, w: msg.Rect.W, h: msg.Rect.H}
+		// 06：窗已显示时原子移动（一次 SetWindowPos，不闪烁）。
+		if c.shown {
+			c.cw.moveAnchor(c.anchor)
+		}
 
 	case "focus_out":
 		resp, err := c.mgr.FocusOut(env.SID)
@@ -182,7 +190,7 @@ func (c *conn) dispatch(env ipc.Envelope) bool {
 			return true
 		}
 		c.sendResponse(env.SID, resp)
-		c.cw.hideWindow()
+		c.hide()
 
 	case "key":
 		var msg keyMsg
@@ -219,7 +227,9 @@ func (c *conn) dispatch(env ipc.Envelope) bool {
 	case "ping":
 		var msg pingMsg
 		_ = json.Unmarshal(env.Payload, &msg)
-		_ = c.send("pong", env.SID, pingMsg{TS: msg.TS})
+		if err := c.send("pong", env.SID, pingMsg{TS: msg.TS}); err != nil {
+			log.Printf("发送 pong: %v", err)
+		}
 
 	case "bye":
 		return false
@@ -261,23 +271,35 @@ func (c *conn) sendResponse(sid string, resp engine.Response) {
 	for _, cd := range resp.Candidates {
 		cands = append(cands, candidateMsg{Text: cd.Text, Comment: cd.Comment})
 	}
-	_ = c.send("update", sid, updateMsg{
+	if err := c.send("update", sid, updateMsg{
 		Preedit:    resp.Preedit,
 		Caret:      resp.Caret,
 		Candidates: cands,
 		PageIndex:  resp.PageIndex,
 		Mode:       modeMsg{Chinese: resp.Mode.Chinese, FullPunct: resp.Mode.FullPunct},
-	})
+	}); err != nil {
+		log.Printf("发送 update: %v", err)
+	}
 	if resp.Commit != "" {
-		_ = c.send("commit", sid, commitMsg{Text: resp.Commit})
-		c.cw.hideWindow()
+		if err := c.send("commit", sid, commitMsg{Text: resp.Commit}); err != nil {
+			log.Printf("发送 commit: %v", err)
+		}
+		c.hide()
 		return
 	}
-	if len(cands) > 0 {
+	// 06:43：坐标过期（无有效 caret）时隐藏而非渲染。
+	if len(cands) > 0 && c.anchor.w > 0 && c.anchor.h > 0 {
 		c.cw.render(resp.Preedit, cands, resp.PageIndex, c.anchor, c.owner)
+		c.shown = true
 		return
 	}
+	c.hide()
+}
+
+// hide 隐藏候选窗并同步可见性状态（06 可见性状态机）。
+func (c *conn) hide() {
 	c.cw.hideWindow()
+	c.shown = false
 }
 
 func firstRune(s string) rune {

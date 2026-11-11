@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +31,7 @@ func main() {
 	)
 	flag.Parse()
 	log.SetPrefix("silkhost ")
+	declareDPIAwareness()
 
 	paths, err := config.DefaultPaths()
 	if err != nil {
@@ -99,12 +99,6 @@ func main() {
 	}
 	log.Printf("就绪：%s", name)
 
-	var (
-		lastActive atomic.Int64
-		activeConn atomic.Int32
-	)
-	lastActive.Store(time.Now().UnixNano())
-
 	shutdown := make(chan struct{})
 	go func() {
 		sig := make(chan os.Signal, 1)
@@ -120,10 +114,7 @@ func main() {
 			if err != nil {
 				return
 			}
-			activeConn.Add(1)
-			lastActive.Store(time.Now().UnixNano())
 			go func(nc net.Conn) {
-				defer activeConn.Add(-1)
 				log.Print("接受 shim 连接")
 				c := &conn{nc: nc, mgr: mgr, cw: cw, snapshot: cfgSnapshot{
 					PageSize:  cfg.PageSize,
@@ -131,7 +122,6 @@ func main() {
 					FullPunct: true,
 				}}
 				c.run()
-				lastActive.Store(time.Now().UnixNano())
 			}(nc)
 		}
 	}()
@@ -145,7 +135,8 @@ func main() {
 			shutdownHost(mgr)
 			return
 		case <-tick.C:
-			if activeConn.Load() == 0 && time.Since(time.Unix(0, lastActive.Load())) > idle {
+			// 04:110：无会话空闲超过阈值退出（连接常驻不算活动）。
+			if mgr.ActiveSessions() == 0 && time.Since(mgr.LastUse()) > idle {
 				log.Print("空闲超时，退出")
 				shutdownHost(mgr)
 				return
@@ -158,6 +149,20 @@ func shutdownHost(mgr *session.Manager) {
 	if err := mgr.Close(); err != nil {
 		log.Printf("落盘用户词库: %v", err)
 	}
+}
+
+// declareDPIAwareness 声明 per-monitor DPI aware v2（06:50：host 进程声明，
+// shim 内渲染按宿主进程 DPI 等级工作）；旧系统回退系统级 DPI 感知。
+func declareDPIAwareness() {
+	user32 := windows.NewLazySystemDLL("user32.dll")
+	setCtx := user32.NewProc("SetProcessDpiAwarenessContext")
+	// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (HANDLE)-4
+	if setCtx.Find() == nil {
+		if r, _, _ := setCtx.Call(^uintptr(3)); r != 0 {
+			return
+		}
+	}
+	user32.NewProc("SetProcessDPIAware").Call()
 }
 
 func currentUserSID() (string, error) {

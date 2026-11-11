@@ -9,8 +9,10 @@ package engine
 type ModMask uint8
 
 // KeyCode 是平台无关的语义键码。宿主负责把虚拟键翻译到这一层。
+// 数值是线格式契约的一部分（04 协议）：tsftip 侧镜像同一编号，既有值不可变更。
 type KeyCode uint16
 
+// 字母键 KeyA–KeyZ = 1–26。
 const (
 	KeyA KeyCode = iota + 1
 	KeyB
@@ -40,6 +42,7 @@ const (
 	KeyZ
 )
 
+// 数字键 Key0–Key9 = 27–36。
 const (
 	Key0 KeyCode = iota + 1 + KeyZ
 	Key1
@@ -53,6 +56,7 @@ const (
 	Key9
 )
 
+// 编辑/控制键与标点：Space=37、Enter=38、Backspace=39、Esc=40、PageUp=41、PageDown=42、Punct=43（配 Key.Rune）。
 const (
 	KeySpace KeyCode = iota + 1 + Key9
 	KeyEnter

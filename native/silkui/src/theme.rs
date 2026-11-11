@@ -170,7 +170,6 @@ fn apps_use_light_theme() -> Option<bool> {
         )
     };
     // PWSTR 仅为签名占位，未使用。
-    let _ = PWSTR::null();
     if status.is_ok() {
         Some(data != 0)
     } else {

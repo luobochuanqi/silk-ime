@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use silk_protocol::{
     Envelope, TYPE_ACTION, TYPE_BYE, TYPE_CARET, TYPE_FOCUS_IN, TYPE_FOCUS_OUT, TYPE_HELLO,
-    TYPE_KEY, TYPE_UPDATE, TYPE_WELCOME, VERSION,
+    TYPE_KEY, TYPE_PING, TYPE_UPDATE, TYPE_WELCOME, VERSION,
 };
 
 /// TIP 构建号，进入 hello，便于 host 侧诊断混装版本。
@@ -111,6 +111,11 @@ pub fn key(id: u64, sid: &str, code: u16, rune: Option<char>, down: bool, mods: 
         payload["rune"] = Value::String(rune.to_string());
     }
     envelope(id, TYPE_KEY, Some(sid), payload)
+}
+
+/// 空闲存活探测（04:72，30 s 一次）；host 原样回 `pong`，本层不需要处理回应。
+pub fn ping(ts: u64) -> Envelope {
+    envelope(0, TYPE_PING, None, json!({ "ts": ts }))
 }
 
 /// `action` 的四种语义：选择、翻页、模式切换、取消。
@@ -256,6 +261,14 @@ mod tests {
         );
         assert_eq!(env.payload["rect"]["h"], 16);
         env.validate().expect("caret 合法");
+    }
+
+    #[test]
+    fn ping_carries_timestamp() {
+        let env = ping(1234);
+        assert_eq!(env.type_, TYPE_PING);
+        assert_eq!(env.payload["ts"], 1234);
+        env.validate().expect("ping 合法");
     }
 
     #[test]

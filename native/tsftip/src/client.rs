@@ -1,6 +1,6 @@
 //! 命名管道客户端：读线程 + 请求通道 + 后台连接线程。
 //!
-//! TSF 回调线程只做一次有界等待（15 ms），协议读写、连接与 host 拉起全部落在
+//! TSF 回调线程只做一次有界等待（30 ms），协议读写、连接与 host 拉起全部落在
 //! 独立线程上：回调路径永不等待连接建立，未就绪时按键走 fail-open 直通，连接
 //! 就绪后由下一次请求自动接上。
 //!
@@ -39,7 +39,11 @@ use crate::msg::{self, Incoming};
 use crate::util;
 
 /// 热路径硬超时：超时即放行按键，不丢键（04 降级矩阵）。
-pub const KEY_TIMEOUT: Duration = Duration::from_millis(15);
+///
+/// 30 ms 与端到端预算（p95 ≤ 30 ms）对齐：15 ms 会贴着 Windows 调度量子，
+/// 单次抢占就会超时放行、字母裸落（真机 14% 脏数据率）；代价是真死等时
+/// 按键最多晚 30 ms 直通，肉眼不可感。
+pub const KEY_TIMEOUT: Duration = Duration::from_millis(30);
 /// 拉起 host 后等 `welcome` 就绪的上限。
 const SPAWN_WAIT: Duration = Duration::from_secs(2);
 /// 空转时等命令的切片：worker 借此检查后台连接与空闲 ping。
@@ -234,7 +238,7 @@ impl Link {
 
     /// 等后台线程交出连接，最多 `timeout`。
     ///
-    /// 只有 IO 线程调用：TSF 回调从不进来（它只在自己的 15 ms 预算里等回复）。
+    /// 只有 IO 线程调用：TSF 回调从不进来（它只在自己的 30 ms 预算里等回复）。
     fn wait_ready(&self, timeout: Duration) -> Option<Pipe> {
         let deadline = Instant::now() + timeout;
         let mut state = self.state();
@@ -352,14 +356,17 @@ fn worker_loop(rx: Receiver<Command>, shared: Arc<Shared>, link: Arc<Link>) {
             }
             Err(RecvTimeoutError::Disconnected) => return,
         };
+        let mut fresh = false;
         if pipe.is_none() {
             pipe = link.take();
+            fresh = pipe.is_some();
         }
         if pipe.is_none() {
             // 尚未连上：唤醒后台建连，并在这里**有界**等它交出连接。等待发生在 IO
-            // 线程上，TSF 回调早已按自己的 15 ms 预算返回 Disconnected（fail-open）。
+            // 线程上，TSF 回调早已按自己的 30 ms 预算返回 Disconnected（fail-open）。
             link.request();
             pipe = link.wait_ready(SPAWN_WAIT);
+            fresh = pipe.is_some();
         }
         let Some(mut conn) = pipe.take() else {
             // 建连失败：当场 fail-open（04 降级矩阵），后台按限速继续重试。
@@ -367,11 +374,13 @@ fn worker_loop(rx: Receiver<Command>, shared: Arc<Shared>, link: Arc<Link>) {
             let _ = cmd.reply.send(Reply::Disconnected);
             continue;
         };
-        // 新连接先补发焦点：host 的会话表是 per-连接状态，否则每个 key 都只会收到
-        // 「未知会话」。
-        if let Some(focus) = shared.focus() {
-            if let Ok(frame) = encode(&msg::focus_in(0, &focus.sid, &focus.app, focus.hwnd)) {
-                let _ = conn.write(&frame);
+        // 仅新连接补发焦点（host 的会话表是 per-连接状态）：每次请求都补发会让
+        // host 回一条空 update 混进本键响应，回放成「清空组字」（真机踩过）。
+        if fresh {
+            if let Some(focus) = shared.focus() {
+                if let Ok(frame) = encode(&msg::focus_in(0, &focus.sid, &focus.app, focus.hwnd)) {
+                    let _ = conn.write(&frame);
+                }
             }
         }
         last_tx = Instant::now();
@@ -1011,15 +1020,15 @@ mod tests {
         let client = Client::new();
         let started = Instant::now();
         let reply = client.request(&crate::msg::hello(), true, Duration::from_millis(15));
-        // 本机没有 host 时是 Timeout/Disconnected；有 host 时 15 ms 内连上属正常。
+        // 本机没有 host 时是 Timeout/Disconnected；有 host 时 30 ms 内连上属正常。
         assert!(!matches!(reply, Reply::Messages(ref m) if m.is_empty()));
-        assert!(started.elapsed() < Duration::from_secs(2), "15 ms 预算未守住");
+        assert!(started.elapsed() < Duration::from_secs(2), "30 ms 预算未守住");
     }
 
     #[test]
     fn request_never_waits_for_connection_setup() {
         // 03:83：连接建立（CreateProcess + 等 welcome，上限 2 s）在后台线程，回调
-        // 路径只等 15 ms 的响应预算，因此冷启动时首次请求也必须立刻返回。
+        // 路径只等 30 ms 的响应预算，因此冷启动时首次请求也必须立刻返回。
         let client = Client::new();
         let started = Instant::now();
         for _ in 0..3 {

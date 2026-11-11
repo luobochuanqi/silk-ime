@@ -83,7 +83,9 @@ func main() {
 		name = `\\.\pipe\silk-ime-` + sid
 	}
 	ln, err := winio.ListenPipe(name, &winio.PipeConfig{
-		SecurityDescriptor: "D:P(A;;GA;;;" + sid + ")",
+		// S:(ML;;NW;;;ME) 把管道的强制完整性定为中级：host 可能被高完整性宿主里的
+		// shim 拉起，默认的高标签会让普通权限的 shim/后续实例一律 Access denied（O-4）。
+		SecurityDescriptor: "D:P(A;;GA;;;" + sid + ")S:(ML;;NW;;;ME)",
 		// 字节模式：帧由长度前缀自定界；消息模式按写分消息会劈开帧边界
 		MessageMode:      false,
 		InputBufferSize:  64 << 10,

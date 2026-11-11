@@ -158,7 +158,7 @@ impl Tip {
             app: app.clone(),
             hwnd: hwnd_raw,
         }));
-        // 只唤醒后台建连线程，不在这里等它（03:83 回调 15 ms 上限）。
+        // 只唤醒后台建连线程，不在这里等它（03:83 回调 30 ms 上限）。
         self.session.warm();
         let env = msg::focus_in(0, &sid, &app, hwnd_raw);
         if let crate::client::Reply::Messages(messages) = self.session.request(&env, true) {
@@ -228,7 +228,7 @@ impl Tip {
         }
     }
 
-    /// 显式切换（不在热路径上要求零延迟，但仍用同一 15 ms 预算）。
+    /// 显式切换（不在热路径上要求零延迟，但仍用同一 30 ms 预算）。
     fn toggle_mode(&self) -> bool {
         let mode = self.session.mode();
         let sid = self.session.lock().sid.clone();

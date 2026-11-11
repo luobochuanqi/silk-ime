@@ -96,7 +96,7 @@ impl Session {
         format!("s-{}", self.sid_counter.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
-    /// 发送会话请求并等待最多 15 ms。返回下行消息序列。
+    /// 发送会话请求并等待最多 30 ms。返回下行消息序列。
     pub fn request(&self, env: &Envelope, want_reply: bool) -> Reply {
         self.client.request(env, want_reply, crate::client::KEY_TIMEOUT)
     }
@@ -112,8 +112,12 @@ impl Session {
     }
 
     /// 把下行消息转成编辑意图，并同步模式缓存。
+    ///
+    /// update 是全量状态快照而非增量：一批响应里只保留最后一条，早期快照
+    /// （如补发焦点产生的空 update）不得回放成「清空组字」。
     pub fn absorb(&self, messages: &[Incoming]) -> Vec<EditIntent> {
         let mut intents = Vec::new();
+        let mut last_update: Option<UpdatePayload> = None;
         for incoming in messages {
             match incoming {
                 Incoming::Update(update) => {
@@ -121,14 +125,22 @@ impl Session {
                     if let Some(mode) = update.mode {
                         self.shared.set_mode(mode.chinese, mode.full_punct);
                     }
-                    intents.push(EditIntent::Update(update.clone()));
+                    last_update = Some(update.clone());
                 }
-                Incoming::Commit(text) => intents.push(EditIntent::Commit(text.clone())),
+                Incoming::Commit(text) => {
+                    if let Some(update) = last_update.take() {
+                        intents.push(EditIntent::Update(update));
+                    }
+                    intents.push(EditIntent::Commit(text.clone()));
+                }
                 Incoming::Welcome(cfg) => {
                     self.shared.set_mode(cfg.chinese, cfg.full_punct);
                 }
                 _ => {}
             }
+        }
+        if let Some(update) = last_update {
+            intents.push(EditIntent::Update(update));
         }
         intents
     }
@@ -158,7 +170,7 @@ impl Session {
         state.shown = false;
     }
 
-    /// 处理一次按键，含 15 ms 超时降级。
+    /// 处理一次按键，含 30 ms 超时降级。
     ///
     /// 超时或断连时返回 eaten=false：按键原样放行，绝不吞键（04 降级矩阵）。
     pub fn handle_key(
@@ -204,6 +216,11 @@ impl Session {
 
     /// 把编辑意图提交给 TSF。渲染或编辑失败只降级隐藏，不向调用方抛出。
     fn commit_to_edit(self: &Arc<Self>, intent: &EditIntent) -> bool {
+        // 候选/分页状态先落到 State：数字键选词（digit_select）与 UIless 候选
+        // 元素都读它；此前该更新缺失导致按数字键无响应（真机踩过）。
+        if let EditIntent::Update(update) = intent {
+            self.apply_update(update);
+        }
         match crate::edit::apply(self, intent) {
             Ok(()) => true,
             Err(_) => {

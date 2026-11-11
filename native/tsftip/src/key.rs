@@ -111,7 +111,7 @@ fn edit_code(vk: u16) -> Option<u16> {
 /// 拦截决策。
 ///
 /// 英文模式一律放行（零 IPC，英文补全不在本层）；编辑键与数字键只在组合期拦截，
-/// 否则交给应用，避免无谓的 15 ms 往返。Ctrl/Alt 组合留给系统与宿主。
+/// 否则交给应用，避免无谓的 30 ms 往返。Ctrl/Alt 组合留给系统与宿主。
 pub fn decide(vk: u16, mods: u8, mode: Mode, composing: bool) -> Decision {
     if mods & (MOD_CTRL | MOD_ALT) != 0 {
         return Decision::Pass;
@@ -185,7 +185,7 @@ impl EatenKeys {
 
 /// Shift 单键轻按（按下后未插入其他键即抬起）用于中英切换。
 ///
-/// 放在 shim 而不是 host：切换必须在按键瞬间决定是否吞键，走一次 15 ms 往返
+/// 放在 shim 而不是 host：切换必须在按键瞬间决定是否吞键，走一次 30 ms 往返
 /// 会让首键体验抖动，且模式本身以 host 回传为准。
 #[derive(Debug, Default)]
 pub struct ShiftTap {

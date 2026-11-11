@@ -11,7 +11,8 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::Registry::{
-    RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
+    RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD,
+    RRF_RT_REG_SZ,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -118,6 +119,101 @@ pub fn delete_tree(root: HKEY, subkey: &str) -> bool {
     status.is_ok() || status == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND
 }
 
+/// 读子键下的 REG_DWORD 值；缺失或类型不符返回 None。
+pub fn read_dword(root: HKEY, subkey: &str, name: &str) -> Option<u32> {
+    let sub = utf16z(subkey);
+    let namez = utf16z(name);
+    let mut value = 0u32;
+    let mut size = 4u32;
+    // SAFETY: 两个串 NUL 结尾；value 是本栈独占输出，size 初值为其字节容量。
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            pcwstr(&sub),
+            pcwstr(&namez),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    status.is_ok().then_some(value)
+}
+
+/// 写入 REG_DWORD 值。
+pub fn write_dword(root: HKEY, subkey: &str, name: &str, value: u32) -> bool {
+    let sub = utf16z(subkey);
+    let namez = utf16z(name);
+    let bytes = value.to_ne_bytes();
+    // SAFETY: 两个串与数据缓冲都存活到调用结束；REG_DWORD 按字节计 4。
+    let status = unsafe {
+        RegSetKeyValueW(
+            root,
+            pcwstr(&sub),
+            pcwstr(&namez),
+            REG_DWORD.0,
+            Some(bytes.as_ptr().cast()),
+            bytes.len() as u32,
+        )
+    };
+    status.is_ok()
+}
+
+/// 删除子键下的单个值；值不存在也算成功。
+pub fn delete_value(root: HKEY, subkey: &str, name: &str) -> bool {
+    use windows::Win32::System::Registry::RegDeleteKeyValueW;
+    let sub = utf16z(subkey);
+    let namez = utf16z(name);
+    // SAFETY: 两个串 NUL 结尾且存活到调用结束。
+    let status = unsafe { RegDeleteKeyValueW(root, pcwstr(&sub), pcwstr(&namez)) };
+    status.is_ok() || status == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND
+}
+
+/// 枚举子键下的 REG_DWORD 值（值名, 数据）；子键不存在或无值返回空。
+pub fn enum_dword_values(root: HKEY, subkey: &str) -> Vec<(String, u32)> {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegEnumValueW, RegOpenKeyExW, KEY_QUERY_VALUE,
+    };
+    let sub = utf16z(subkey);
+    let mut key = HKEY::default();
+    // SAFETY: sub 是 NUL 结尾串；key 是本栈独占输出。
+    let status =
+        unsafe { RegOpenKeyExW(root, pcwstr(&sub), Some(0), KEY_QUERY_VALUE, &mut key) };
+    if status.is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for index in 0.. {
+        let mut name = vec![0u16; 256];
+        let mut name_len = name.len() as u32;
+        // SAFETY: name 是独占缓冲，name_len 初值为其容量；其余输出参数不取。
+        let status = unsafe {
+            RegEnumValueW(
+                key,
+                index,
+                Some(windows::core::PWSTR(name.as_mut_ptr())),
+                &mut name_len,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        if status.is_err() {
+            break;
+        }
+        let name = String::from_utf16_lossy(&name[..name_len as usize]);
+        if let Some(value) = read_dword(root, subkey, &name) {
+            out.push((name, value));
+        }
+    }
+    // SAFETY: key 由本函数打开，唯一所有者。
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    out
+}
+
 /// 当前进程用户 SID 的字符串形式，管道名与 ACL 都用它。
 pub fn current_user_sid() -> Option<String> {
     let mut token = Default::default();
@@ -173,10 +269,15 @@ fn query_token_sid(token: windows::Win32::Foundation::HANDLE) -> Option<String> 
 }
 
 /// 本 DLL 的完整路径。
+///
+/// `GetModuleFileNameW(NULL)` 返回的是宿主 EXE（rundll32.exe、宿主进程）路径；
+/// 注册表与 host 定位需要 DLL 自身路径，故用 DllMain 记录的模块句柄（`crate::module`）。
+/// 不用按地址反查句柄：那在提权 rundll32 环境下会失败且不可观测（真机踩过）。
 pub fn module_path() -> Option<PathBuf> {
+    let module = crate::module()?;
     let mut buf = vec![0u16; 1024];
-    // SAFETY: buf 是 1024 个 u16 的独占缓冲，内核最多写这么多字符；None 表示本模块。
-    let len = unsafe { GetModuleFileNameW(None, &mut buf) };
+    // SAFETY: buf 是 1024 个 u16 的独占缓冲，内核最多写这么多字符。
+    let len = unsafe { GetModuleFileNameW(Some(module), &mut buf) };
     if len == 0 {
         return None;
     }

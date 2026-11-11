@@ -5,16 +5,20 @@
 
 use std::path::Path;
 
-use windows::core::GUID;
+use windows::core::{w, GUID, Interface, PCWSTR};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::TextServices::{
-    ITfCategoryMgr, ITfInputProcessorProfiles, CLSID_TF_CategoryMgr,
-    CLSID_TF_InputProcessorProfiles, GUID_TFCAT_CATEGORY_OF_TIP, GUID_TFCAT_TIP_KEYBOARD,
+    ITfCategoryMgr, ITfInputProcessorProfileMgr, ITfInputProcessorProfiles, CLSID_TF_CategoryMgr,
+    CLSID_TF_InputProcessorProfiles, GUID_TFCAT_TIP_KEYBOARD, GUID_TFCAT_TIPCAP_COMLESS,
+    GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
+    GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
 };
+use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
 
 use crate::util;
 
@@ -26,12 +30,11 @@ pub const GUID_SILK_PROFILE: GUID = GUID::from_u128(0x0e5f6a7b_8c9d_4e0f_a1b2_c3
 pub const LANGID_ZH_CN: u16 = 0x0804;
 /// 语言栏与键盘列表中显示的名称。
 pub const PROFILE_NAME: &str = "Silk 拼音";
-/// 图标取自 `silk-tsftip.dll` 的资源段（03:34 要求图标非空）。
-///
-/// 资源脚本还没有自带图标，索引 0 指向 DLL 的默认应用图标；加图标后只需改这里。
+/// 图标索引：取 `shell32.dll` 的首个系统图标；自绘图标落地后改回本 DLL 资源段（03:34）。
 pub const PROFILE_ICON_INDEX: u32 = 0;
 
-/// 注册作用域：user 全写 HKCU（无需管理员）；machine 只影响 COM 注册项。
+/// 注册层级：machine = 机器级（COM + TIP + 类别，写 HKLM，需提权）；
+/// user = 用户级（启用 + 用户语言列表，写 HKCU，普通权限）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     User,
@@ -123,36 +126,55 @@ fn categories() -> Option<ITfCategoryMgr> {
     unsafe { CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER) }.ok()
 }
 
-/// 确保 profile 存在并启用进当前用户键盘列表。
+/// 机器级 profile 注册（写 HKLM，需提权）：一次写全 LanguageProfile 各值。
 ///
-/// `AddLanguageProfile` 对已存在的 profile 会失败，这不算错（幂等），真正的
-/// 失败会在后面的 `EnableLanguageProfile` 暴露。
+/// 用 Vista+ 的 `ITfInputProcessorProfileMgr::RegisterProfile`（官方推荐，配方 §7.1-3）；
+/// bEnabledByDefault=false，启用状态由用户级 `EnableLanguageProfile` 决定。
 fn register_profile() -> bool {
     let Some(profiles) = profiles() else {
         return false;
     };
-    let name = util::utf16(PROFILE_NAME);
-    // 图标取自本 TIP 的 DLL 资源段（03:34）：pchIconFile 必须是可定位的路径，
-    // uIconIndex 是资源 id；给裸文件名时 TSF 不保证解析，所以用模块全路径。
-    let icon_file = util::utf16(&util::module_path().unwrap_or_default().to_string_lossy());
-    // SAFETY: profiles 有效；两个字符串参数按「指针 + 字符数」传（AddLanguageProfile
-    // 的 cchDesc/cchIconFile），缓冲在本函数内独占且覆盖整个调用；GUID/CLSID 为静态
-    // 常量。返回值按幂等处理。
+    // 字符串以含终止符的容量传入：cch 按缓冲容量解释的实现会一直读到 NUL，
+    // 无终止符的切片在页边界上会越界（真机出现过 MSCTF.dll 内的间歇性 AV）。
+    let name = util::utf16z(PROFILE_NAME);
+    // 本 DLL 暂无资源段，空资源索引取不到图标句柄；指向确定存在的系统图标文件。
+    let icon_file = util::utf16z(&format!(
+        r"{}\System32\shell32.dll",
+        std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())
+    ));
+    // SAFETY: profiles 有效；两个字符串缓冲独占且覆盖整个调用；GUID/CLSID 为静态
+    // 常量；hklsubstitute 为空表示无替代布局。返回 false 由上层记日志并整体报错。
     unsafe {
-        let _ = profiles.Register(&CLSID_SILK_TIP);
-        // 已存在时失败即幂等成功：真正的问题是随后 EnableLanguageProfile 能否成功。
-        let _ = profiles.AddLanguageProfile(
+        let Ok(mgr) = profiles.cast::<ITfInputProcessorProfileMgr>() else {
+            return false;
+        };
+        mgr.RegisterProfile(
             &CLSID_SILK_TIP,
             LANGID_ZH_CN,
             &GUID_SILK_PROFILE,
             &name,
             &icon_file,
             PROFILE_ICON_INDEX,
-        );
-        profiles
-            .EnableLanguageProfile(&CLSID_SILK_TIP, LANGID_ZH_CN, &GUID_SILK_PROFILE, true)
-            .is_ok()
+            HKL(core::ptr::null_mut()),
+            0,
+            false,
+            0,
+        )
+        .is_ok()
     }
+}
+
+/// 配方 §7.1-4 的类别集合：键盘类别决定「添加键盘」候选资格，TIPCAP 系列决定
+/// 切换器、现代宿主、托盘等能力过滤；缺项会被过滤（五家实现全有）。
+fn categories_list() -> [GUID; 6] {
+    [
+        GUID_TFCAT_TIP_KEYBOARD,
+        GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+        GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
+        GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+        GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
+        GUID_TFCAT_TIPCAP_COMLESS,
+    ]
 }
 
 fn register_categories() -> bool {
@@ -162,7 +184,7 @@ fn register_categories() -> bool {
     let mut ok = true;
     // SAFETY: mgr 有效；CLSID/GUID 均为静态常量，RegisterCategory 只读它们。
     unsafe {
-        for catid in [GUID_TFCAT_TIP_KEYBOARD, GUID_TFCAT_CATEGORY_OF_TIP] {
+        for catid in categories_list() {
             ok &= mgr
                 .RegisterCategory(&CLSID_SILK_TIP, &catid, &CLSID_SILK_TIP)
                 .is_ok();
@@ -171,33 +193,115 @@ fn register_categories() -> bool {
     ok
 }
 
-/// 注册全部内容，并写 host 懒启动用的安装目录（DLL 所在目录）。
-pub fn register(scope: Scope) -> bool {
+/// 机器级注册（必须提权）：COM + TIP profile + 类别，全部写 HKLM。
+///
+/// 这组 API 非提权一律 E_FAIL（配方 §1），任一步失败整体报错，不产出
+/// 「看得见但激活失败」的幽灵条目（配方 §3）。rundll32 不自动提权。
+pub fn register_machine() -> bool {
     let _guard = ComGuard::enter();
     let Some(dir) = util::module_dir() else {
+        report(Scope::Machine, "register_machine", "module_dir 不可用", false);
         return false;
     };
-    register_into(scope, &dir)
-}
-
-fn register_into(scope: Scope, dir: &Path) -> bool {
     // 用真实模块路径而不是拼文件名：cargo 产物名与安装名可能不同（见 README 的改名步骤）。
     let dll = util::module_path().unwrap_or_else(|| dir.join("silk-tsftip.dll"));
-    let com = register_com(scope, &dll);
+    let com = register_com(Scope::Machine, &dll);
     let profile = register_profile();
     let cats = register_categories() && crate::ui::register_display_attribute();
-    let install = util::write_install_path(dir);
-    com && profile && cats && install
+    let ok = com && profile && cats;
+    report(
+        Scope::Machine,
+        "register_machine",
+        &format!("dir={} com={com} profile={profile} cats={cats}", dir.display()),
+        ok,
+    );
+    ok
 }
 
-/// 逆序清理：类别 → profile → COM → 安装目录。
-pub fn unregister(scope: Scope) -> bool {
+/// 用户级注册（普通权限）：启用 profile、登记进用户语言列表、写 host 懒启动目录。
+///
+/// 用户语言列表成员资格决定 Win+空格 的可见性（配方 §2.2）。
+pub fn register_user() -> bool {
+    let _guard = ComGuard::enter();
+    let Some(profiles) = profiles() else {
+        report(Scope::User, "register_user", "ITfInputProcessorProfiles 不可用", false);
+        return false;
+    };
+    // SAFETY: profiles 有效；GUID/CLSID 为静态常量，本调用只改用户级启用位。
+    let enable = unsafe {
+        profiles
+            .EnableLanguageProfile(&CLSID_SILK_TIP, LANGID_ZH_CN, &GUID_SILK_PROFILE, true)
+    }
+    .is_ok();
+    let list = add_user_language_list();
+    let install = util::module_dir().is_some_and(|dir| util::write_install_path(&dir));
+    let ok = enable && list && install;
+    report(
+        Scope::User,
+        "register_user",
+        &format!("enable={enable} list={list} install={install}"),
+        ok,
+    );
+    ok
+}
+
+/// 用户语言列表子键：产品当前范围是简体中文（0x0804）。
+const USER_LIST_SUBKEY: &str = r"Control Panel\International\User Profile\zh-Hans-CN";
+
+/// 值名格式 `0804:<CLSID><Profile>`：两段带花括号的 GUID 紧邻（系统真实形态）。
+fn user_list_value_name() -> String {
+    format!(
+        "0804:{}{}",
+        format_guid(&CLSID_SILK_TIP),
+        format_guid(&GUID_SILK_PROFILE)
+    )
+}
+
+/// 登记进用户语言列表。序号必须是 1 起连续，空洞会让 InputSwitch.dll 崩
+///（PIME 注释，配方 §7.1-5）；已连续时保持原序不动。
+fn add_user_language_list() -> bool {
+    let name = user_list_value_name();
+    let mut entries = util::enum_dword_values(HKEY_CURRENT_USER, USER_LIST_SUBKEY);
+    if !entries.iter().any(|(n, _)| *n == name) {
+        let next = entries.iter().map(|(_, v)| *v).max().unwrap_or(0) + 1;
+        entries.push((name, next));
+    }
+    write_user_list(&entries)
+}
+
+fn remove_user_language_list() -> bool {
+    let name = user_list_value_name();
+    let mut entries = util::enum_dword_values(HKEY_CURRENT_USER, USER_LIST_SUBKEY);
+    let had = entries.iter().any(|(n, _)| *n == name);
+    entries.retain(|(n, _)| *n != name);
+    let ok = if had {
+        util::delete_value(HKEY_CURRENT_USER, USER_LIST_SUBKEY, &name)
+    } else {
+        true
+    };
+    write_user_list(&entries) && ok
+}
+
+fn write_user_list(entries: &[(String, u32)]) -> bool {
+    let mut sorted: Vec<&(String, u32)> = entries.iter().collect();
+    sorted.sort_by_key(|(_, v)| *v);
+    let contiguous = sorted.iter().enumerate().all(|(i, (_, v))| *v == i as u32 + 1);
+    let mut ok = true;
+    for (i, (name, value)) in sorted.iter().enumerate() {
+        let data = if contiguous { *value } else { i as u32 + 1 };
+        ok &= util::write_dword(HKEY_CURRENT_USER, USER_LIST_SUBKEY, name, data);
+    }
+    ok
+}
+
+/// 机器级反注册（提权）：类别 → profile → COM 逆序清理，幂等。
+pub fn unregister_machine() -> bool {
     let _guard = ComGuard::enter();
     if let Some(mgr) = categories() {
         // SAFETY: mgr 有效；撤销「项不存在」属于幂等成功，与注册时的失败语义对称
         // （03:46：重复注销不报错），因此这里不计入 ok。
         unsafe {
-            for catid in [GUID_TFCAT_TIP_KEYBOARD, GUID_TFCAT_CATEGORY_OF_TIP] {
+            for catid in categories_list() {
                 let _ = mgr.UnregisterCategory(&CLSID_SILK_TIP, &catid, &CLSID_SILK_TIP);
             }
         }
@@ -213,27 +317,55 @@ pub fn unregister(scope: Scope) -> bool {
             let _ = profiles.Unregister(&CLSID_SILK_TIP);
         }
     }
-    let mut ok = unregister_com(scope);
-    // 安装目录值是 per-user 的懒启动输入，只有 user 作用域注销时才清理；
-    // Machine 注销不得动 HKCU（那是另一个用户态账户的注册）。
-    if scope == Scope::User {
-        ok &= util::delete_tree(HKEY_CURRENT_USER, r"Software\Silk");
-    }
+    let mut ok = unregister_com(Scope::Machine);
+    // 历史版本写过按用户的 COM 注册，一并清理。
+    ok &= util::delete_tree(HKEY_CURRENT_USER, &clsid_key());
+    report(Scope::Machine, "unregister_machine", "", ok);
     ok
+}
+
+/// 用户级反注册（普通权限）：移出用户语言列表并压实序号、停用 profile、清理安装目录值。
+pub fn unregister_user() -> bool {
+    let _guard = ComGuard::enter();
+    let list = remove_user_language_list();
+    if let Some(profiles) = profiles() {
+        // SAFETY: 同 register_user；不存在的 profile 停用失败按幂等处理。
+        let _ = unsafe {
+            profiles.EnableLanguageProfile(&CLSID_SILK_TIP, LANGID_ZH_CN, &GUID_SILK_PROFILE, false)
+        };
+    }
+    let install = util::delete_tree(HKEY_CURRENT_USER, r"Software\Silk");
+    let ok = list && install;
+    report(Scope::User, "unregister_user", &format!("list={list} install={install}"), ok);
+    ok
+}
+
+/// rundll32 入口没有控制台：结果写入 silkreg.log，失败另弹窗，避免静默失败不可诊断。
+fn report(scope: Scope, action: &str, detail: &str, ok: bool) {
+    use std::io::Write;
+    let line = format!("{action} scope={scope:?} ok={ok} {detail}");
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+        let dir = Path::new(&dir).join("Silk").join("logs");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            if let Ok(mut f) =
+                std::fs::OpenOptions::new().create(true).append(true).open(dir.join("silkreg.log"))
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+    }
+    if !ok {
+        let text = util::utf16z(&line);
+        // SAFETY: 文本 NUL 结尾且存活到调用结束；无属主窗口，MB_OK 等用户确认。
+        unsafe {
+            MessageBoxW(None, PCWSTR(text.as_ptr()), w!("Silk 注册"), MB_OK | MB_ICONWARNING);
+        }
+    }
 }
 
 /// 安装器提升上下文里注册完后，以原用户身份补登记键盘列表（03 的踩坑项）。
 pub fn register_self() -> bool {
-    let _guard = ComGuard::enter();
-    let Some(profiles) = profiles() else {
-        return false;
-    };
-    // SAFETY: profiles 有效；CLSID/GUID 为静态常量，本调用只改用户键盘列表状态。
-    unsafe {
-        profiles
-            .EnableLanguageProfile(&CLSID_SILK_TIP, LANGID_ZH_CN, &GUID_SILK_PROFILE, true)
-            .is_ok()
-    }
+    register_user()
 }
 
 /// rundll32 的命令行尾串：NUL 结尾的 ANSI 文本，可能为空。
@@ -257,14 +389,28 @@ pub unsafe fn cmd_arg(cmd: *const u8) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// `SilkRegister` 的实现体。
+/// `SilkRegister` 的实现体：machine = 机器级（提权），user = 用户级（普通权限）。
 pub fn run_register(cmd: Option<&str>) {
-    let _ = register(Scope::parse(cmd));
+    match Scope::parse(cmd) {
+        Scope::Machine => {
+            let _ = register_machine();
+        }
+        Scope::User => {
+            let _ = register_user();
+        }
+    }
 }
 
-/// `SilkUnregister` 的实现体。
+/// `SilkUnregister` 的实现体，与注册的层级语义对称。
 pub fn run_unregister(cmd: Option<&str>) {
-    let _ = unregister(Scope::parse(cmd));
+    match Scope::parse(cmd) {
+        Scope::Machine => {
+            let _ = unregister_machine();
+        }
+        Scope::User => {
+            let _ = unregister_user();
+        }
+    }
 }
 
 #[cfg(test)]

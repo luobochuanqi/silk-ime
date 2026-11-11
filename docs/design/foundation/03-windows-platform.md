@@ -28,26 +28,29 @@
 
 ### 注册内容
 
-| 步骤 | 机制 | 写入位置（per-user / per-machine） |
+| 步骤 | 机制 | 写入位置 |
 | --- | --- | --- |
-| COM in-proc server | CLSID、`InprocServer32`、`ThreadingModel=Apartment` | `HKCU\Software\Classes\CLSID\…` / `HKLM\Software\Classes\CLSID\…` |
-| TIP 注册 | `ITfInputProcessorProfiles::Register` + `AddLanguageProfile`（语言 `0x0804`，profile GUID，名称/图标/描述） | `…\Microsoft\CTF\TIP\{CLSID}\LanguageProfile\0x0804\{ProfileGUID}` |
-| 类别注册 | `ITfCategoryMgr::RegisterCategory`（`GUID_TFCAT_TIP_KEYBOARD`、`GUID_TFCAT_CATEGORY_OF_TIP`） | `…\CTF\TIP\{CLSID}\Category\…` |
+| COM in-proc server | CLSID、`InprocServer32`、`ThreadingModel=Apartment` | `HKLM\Software\Classes\CLSID\…`（机器级） |
+| TIP 注册 | `ITfInputProcessorProfileMgr::RegisterProfile`（语言 `0x0804`，profile GUID，名称/图标，`bEnabledByDefault=false`） | `…\Microsoft\CTF\TIP\{CLSID}\LanguageProfile\0x0804\{ProfileGUID}`（HKLM） |
+| 类别注册 | `ITfCategoryMgr::RegisterCategory`（`GUID_TFCAT_TIP_KEYBOARD` + 五类 TIPCAP） | `…\CTF\TIP\{CLSID}\Category\…`（HKLM） |
+| 用户启用 | `ITfInputProcessorProfiles::EnableLanguageProfile` | `…\LanguageProfile\…\Enable`（HKCU） |
+| 用户语言列表 | 直接写 `Control Panel\International\User Profile\zh-Hans-CN` 的 `0804:<CLSID><Profile>` 值（序号 1..N 连续，空洞会让 InputSwitch.dll 崩） | HKCU |
 
 ### 作用域
 
-- **per-user（默认）**：全部写 HKCU，无需管理员。用户级注册是平台支持的标准形态（同产品均提供普通用户安装路径）。
-- **per-machine（可选）**：写 HKLM，需管理员；与 UIAccess 候选窗模式配套（UIAccess 要求签名 + 清单 + 受信任目录，见 07）。
+- **机器级（必须提权）**：COM + TIP + 类别三件套写 HKLM。这组 API 非提权一律 `E_FAIL`，且平台**不存在**"按用户注册键盘 TIP"的形态（调研 [windows-ime-registration-2026.md](../../research/windows-ime-registration-2026.md) §1.3；Weasel/PIME/青简/清风/Mozc 全部提权注册）。任何失败必须显式报错，禁止吞 HRESULT。
+- **用户级（普通权限）**：`Enable` 位 + 用户语言列表 + `InstallPath`。用户语言列表成员资格决定 Win+空格 可见性；只写它不写机器级会产出「看得见、激活失败」的幽灵条目（调研 §3）。
 
 ### 导出接口（ADR-6）
 
 ```
-SilkRegister(scope)    // scope: user | machine；幂等
-SilkUnregister(scope)  // 逆序清理三类注册；幂等
-SilkRegisterSelf()     // 供安装后"登记进当前用户键盘列表"的补登记
+SilkRegister(machine)  // 机器级三件套，提权运行；幂等
+SilkRegister(user)     // 用户级：Enable + 用户语言列表 + InstallPath；幂等
+SilkUnregister(scope)  // 与注册对称清理（含用户语言列表序号重排）；幂等
+SilkRegisterSelf()     // = SilkRegister(user)，供安装器提升后以原用户身份补登记
 ```
 
-注册后需将 profile 登记进用户键盘列表才能出现在语言切换中（Win+空格）；安装器在提升安装后以**原始用户身份**补登记一次（竞品踩过的坑：提升上下文注册到了管理员账户）。
+注册结果写 `%LOCALAPPDATA%\Silk\logs\silkreg.log`，失败另弹提示框（rundll32 无控制台，静默失败在真机排查中代价极高）。安装器流程：提升注册机器级 → 以**原始用户身份**跑 `SilkRegisterSelf`（竞品踩过的坑：提升上下文注册到了管理员账户）。
 
 ### 激活感知
 
@@ -80,7 +83,7 @@ sequenceDiagram
 要点：
 
 - **每线程一个 TIP 实例**，实例数 = 活跃文本线程数。实例内状态无共享；跨线程共享状态只存在于 host（会话运行时负责并发模型）。
-- **TSF 回调里禁止长阻塞**。所有对 host 的请求有硬超时（默认 15 ms，见 04）；edit session 只做 composition 文本更新，不做业务计算。
+- **TSF 回调里禁止长阻塞**。所有对 host 的请求有硬超时（默认 30 ms，见 04）；edit session 只做 composition 文本更新，不做业务计算。
 - **窗口切换是竞态高发区**（小狼毫"切换/新建窗口时多线程崩溃"的教训）。焦点、文档、会话三者的状态迁移在 shim 内串行化到单一状态机，任何 TSF 回调只投递事件，不直接改共享状态。
 - **初始化时机**：D3D/DXGI 工厂与设备不得在 `DllMain` 中创建/释放（DXGI 官方约束）；渲染栈初始化延后到 `ActivateEx`/首次绘窗。
 
@@ -133,9 +136,9 @@ stateDiagram-v2
 | ID | 事项 | 验证方法 |
 | --- | --- | --- |
 | O-1 | Rust 产出 Arm64X DLL 的工具链可行性 | 最小 TIP 探针在 x64/arm64 宿主加载 |
-| O-2 | per-user 注册在 Win10 21H2+ / Win11 的行为一致性 | 两台干净虚拟机安装探针 |
+| O-2 | ~~per-user 注册在 Win10 21H2+ / Win11 的行为一致性~~ | 已结论：平台无 per-user 键盘 TIP 注册，配方见 [注册调研](../../research/windows-ime-registration-2026.md) |
 | O-3 | `GetTextExt` 在 WinUI/终端的坐标语义 | 探针记录坐标与实际插入点偏差 |
-| O-4 | 高完整性宿主连中完整性 host 管道 | 探针在提权记事本按键 |
+| O-4 | ~~高完整性宿主连中完整性 host 管道~~ | 已修：管道 SD 加 `S:(ML;;NW;;;ME)` 中完整性标签（真机复现过跨 IL Access denied） |
 | O-5 | DLL 占用下的升级替换策略（07） | 安装器脚本在开 N 个应用时升级 |
 
 ## 需求映射

@@ -82,7 +82,7 @@ sequenceDiagram
   participant TIP as shim
   participant HOST as host
   TIP->>HOST: key(sid, code=H, down)
-  Note over TIP: 记 T0，硬超时 15 ms
+  Note over TIP: 记 T0，硬超时 30 ms
   HOST-->>TIP: update(preedit="h", candidates=[好,号,…])
   TIP->>TIP: RequestEditSession 更新 preedit
   TIP->>TIP: silkui.Show(view)（或 host_render）
@@ -96,7 +96,7 @@ sequenceDiagram
   participant TIP as shim
   participant HOST as host
   TIP->>HOST: key(sid, …)
-  Note over TIP: 15 ms 无响应
+  Note over TIP: 30 ms 无响应
   TIP->>TIP: 按键原样放行（fail-open，不丢键）
   TIP->>TIP: 标记会话降级，限速重连/拉起 host
   HOST-->>TIP: 迟到响应（丢弃，不覆盖已放行状态）

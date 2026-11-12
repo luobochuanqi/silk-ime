@@ -23,6 +23,11 @@
 - 测试关注可观察行为、边界条件、错误路径与缺陷回归，不绑定实现细节。
 - 测试保持确定、独立，复用项目现有测试辅助能力；不编写仅为提高覆盖率或重复验证同一行为的样板测试。
 
+## 提交约定
+
+- 提交信息与 PR 标题采用 Conventional Commits：`类型: 中文主题`，类型限定 `feat`/`fix`/`docs`/`refactor`/`perf`/`test`/`chore`，可选 scope；squash 合并下 PR 标题即主干提交信息，release-please 据此维护 CHANGELOG 与版本发布。
+- 主题表达意图而非改动清单；破坏性变更在正文以 `BREAKING CHANGE: ` 标注。
+
 ## 操作规范
 
 - 新增二进制文件时在 `.gitattributes` 登记扩展名。

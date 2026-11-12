@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "go",
+      "bump-minor-pre-major": true,
+      "changelog-sections": [
+        { "type": "feat", "section": "新增" },
+        { "type": "fix", "section": "修复" },
+        { "type": "perf", "section": "性能" },
+        { "type": "refactor", "section": "变更" },
+        { "type": "deps", "section": "依赖" },
+        { "type": "revert", "section": "回滚" },
+        { "type": "docs", "hidden": true },
+        { "type": "chore", "hidden": true },
+        { "type": "test", "hidden": true },
+        { "type": "style", "hidden": true },
+        { "type": "build", "hidden": true },
+        { "type": "ci", "hidden": true }
+      ]
+    }
+  }
+}

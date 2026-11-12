@@ -20,7 +20,7 @@ Silk 已有可运行基座（引擎 + TSF 适配层）。贡献应优先解决�
    .\build.ps1
    ```
 
-4. 提交 Pull Request，说明Summary(简要说明改动的核心逻辑/结构)、Evidence(提供改动有效的具体证据，必须体现 Before / After)、Merge Danger(描述影响范围)；若关联 Issue，请在描述中链接。
+4. 提交 Pull Request：标题遵循 [AGENTS.md](AGENTS.md) 的提交约定（`类型: 中文主题`，squash 合并后即为主干提交信息），正文说明Summary(简要说明改动的核心逻辑/结构)、Evidence(提供改动有效的具体证据，必须体现 Before / After)、Merge Danger(描述影响范围)；若关联 Issue，请在描述中链接。
 
 ## 代码约定
 

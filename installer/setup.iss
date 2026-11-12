@@ -77,11 +77,11 @@ procedure UnregisterTIP;
 var
   Code: Integer;
 begin
-  ExecAsOriginalUser(Rundll, DllArg('SilkUnregister user'), '', SW_HIDE, ewWaitUntilTerminated, Code);
-  if IsAdminInstallMode then
-    Exec(Rundll, DllArg('SilkUnregister machine'), '', SW_HIDE, ewWaitUntilTerminated, Code)
-  else
-    ShellExec('runas', Rundll, DllArg('SilkUnregister machine'), '', SW_HIDE, ewWaitUntilTerminated, Code);
+  // ExecAsOriginalUser 仅限安装期（卸载器内调用抛运行时错误）；卸载时以当前
+  // 身份执行用户级清理，同账户提权不换 HKCU。
+  Exec(Rundll, DllArg('SilkUnregister user'), '', SW_HIDE, ewWaitUntilTerminated, Code);
+  // 已提权时 runas 直接执行不弹窗，未提权时借 UAC（03：机器级三件套必须提权）
+  ShellExec('runas', Rundll, DllArg('SilkUnregister machine'), '', SW_HIDE, ewWaitUntilTerminated, Code);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

@@ -58,6 +58,23 @@ graph TB
 | 崩溃收集 | shim/host 的 minidump（本地保存，默认不上传） | 无网络路径（基座无任何联网代码） |
 | 性能计数 | 热路径分位数（内存环形缓冲） | 仅数值 |
 
+### 运行日志
+
+两端日志同为 logfmt（`key=value` 一行一条），时间为本地毫秒精度，可用同一套 grep 关联：
+
+| | host | shim |
+| --- | --- | --- |
+| 实现 | `log/slog` TextHandler（`internal/logging`） | `log` 门面 + 自带文件输出（`tsftip/src/logger.rs`） |
+| 文件 | `%LOCALAPPDATA%\Silk\logs\silkhost.log`，2 MB × 5 份滚动 | 同目录 `tsftip.log`，所有宿主进程共写，1 MB 滚动保留 1 份 |
+| 关联键 | `conn=<连接号> pid=<对端进程>` | `pid= app= tid=` |
+| 级别 | `silk.toml` 的 `log_level`，环境变量 `SILK_LOG` 优先 | `SILK_LOG` |
+
+级别约定：`info` 只记生命周期（启动、连接、握手、断开及原因）与异常；`warn` 记降级事件（应答超时放行、编辑会话失败、请求处理超过 10 ms）；`debug` 逐请求/逐键记录类别、id、耗时与结果。shim 同步写文件、不起线程（崩溃前的最后几行最有价值），并装 panic hook 先落日志；host 每条连接带 panic 兜底，单连接崩溃不拖垮进程。
+
+用户文本默认只记字符数；本机排障需要看原文时设 `SILK_LOG_TEXT=1`。
+
+排障示例：`setx SILK_LOG debug` 后重启目标应用（shim 随宿主进程读取环境变量；host 由 shim 拉起时继承），用 `Get-Content -Wait` 跟踪两份日志，按 `pid` 把 shim 一侧的 `id=` 与 host 一侧的 `conn=… id=` 对上。
+
 ## 测试金字塔
 
 | 层 | 手段 | 覆盖 |

@@ -56,6 +56,7 @@ var messages = map[string]messageSpec{
 		"v":     {kind: kindNumber, required: true},
 		"caps":  {kind: kindNumber, required: true},
 		"build": {kind: kindString, required: true},
+		"pid":   {kind: kindNumber},
 	}},
 	TypeWelcome: {payload: objectSchema{
 		"v":   {kind: kindNumber, required: true},

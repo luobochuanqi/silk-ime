@@ -70,7 +70,9 @@ pub struct Tip {
 
 impl Tip {
     pub fn new() -> Tip {
-        INSTANCES.fetch_add(1, Ordering::AcqRel);
+        crate::logger::init();
+        let live = INSTANCES.fetch_add(1, Ordering::AcqRel) + 1;
+        log::debug!(live; "TIP 实例创建");
         Tip {
             session: Session::new(),
             composition: Mutex::new(None),
@@ -104,6 +106,8 @@ impl Tip {
     }
 
     /// 通知 host 焦点离开，并把未上屏内容原样上屏（03 失焦策略）。
+    ///
+    /// focus_out 已在 host 侧结束会话；不再追发 bye——连接跨焦点复用。
     fn leave(&self) {
         let (sid, context) = {
             let state = self.session.lock();
@@ -112,7 +116,8 @@ impl Tip {
         if sid.is_empty() {
             return;
         }
-        let reply = self.session.request(&msg::focus_out(0, &sid), true);
+        log::debug!(sid = sid.as_str(); "焦点离开");
+        let reply = self.session.request(&msg::focus_out(0, &sid));
         if let Some(context) = context {
             if let crate::client::Reply::Messages(messages) = reply {
                 for intent in self.session.absorb(&messages) {
@@ -121,7 +126,6 @@ impl Tip {
             }
             crate::ui::end(&self.session, &context);
         }
-        self.session.post(&msg::bye(&sid));
         // 清掉补发用的焦点快照：没有焦点时重连不该凭空造出会话。
         self.session.shared().set_focus(None);
         self.session.clear_composition();
@@ -160,8 +164,9 @@ impl Tip {
         }));
         // 只唤醒后台建连线程，不在这里等它（03:83 回调 30 ms 上限）。
         self.session.warm();
+        log::debug!(sid = sid.as_str(), app = app.as_str(); "焦点进入");
         let env = msg::focus_in(0, &sid, &app, hwnd_raw);
-        if let crate::client::Reply::Messages(messages) = self.session.request(&env, true) {
+        if let crate::client::Reply::Messages(messages) = self.session.request(&env) {
             for intent in self.session.absorb(&messages) {
                 let _ = edit::apply(&self.session, &intent);
             }
@@ -357,6 +362,7 @@ impl ITfTextInputProcessor_Impl for Tip_Impl {
     }
 
     fn Deactivate(&self) -> Result<()> {
+        log::info!("TIP 停用");
         self.leave();
         self.release_sinks();
         Ok(())
@@ -373,6 +379,7 @@ impl ITfTextInputProcessorEx_Impl for Tip_Impl {
             state.tid = tid;
             state.thread_mgr = Some(thread_mgr.clone());
         }
+        log::info!(tid, connected = self.session.shared().is_connected(); "TIP 激活");
 
         // 键盘事件 sink 由 TSF 转发到本实例。
         let keys: ITfKeystrokeMgr = thread_mgr.cast()?;
@@ -567,7 +574,13 @@ impl ITfCompositionSink_Impl for Tip_Impl {
         _ec: u32,
         _composition: Ref<windows::Win32::UI::TextServices::ITfComposition>,
     ) -> Result<()> {
-        // TSF 之外终止了 composition（宿主抢走、切焦点）：清本地状态，不重入上屏。
+        // 宿主或 TSF 在我们之外结束了 composition（点击别处、宿主抢走）：清本地状态，
+        // 并让 host 丢弃组字，否则下一键会接着已消失的拼写继续组字。
+        let sid = self.session.lock().sid.clone();
+        log::debug!(sid = sid.as_str(); "composition 被外部终止");
+        if !sid.is_empty() {
+            self.session.post(&msg::action_cancel(0, &sid));
+        }
         self.session.clear_composition();
         Ok(())
     }

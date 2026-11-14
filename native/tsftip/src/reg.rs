@@ -340,20 +340,16 @@ pub fn unregister_user() -> bool {
     ok
 }
 
-/// rundll32 入口没有控制台：结果写入 silkreg.log，失败另弹窗，避免静默失败不可诊断。
+/// rundll32 入口没有控制台：结果写入 tsftip.log，失败另弹窗，避免静默失败不可诊断。
 fn report(scope: Scope, action: &str, detail: &str, ok: bool) {
-    use std::io::Write;
-    let line = format!("{action} scope={scope:?} ok={ok} {detail}");
-    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
-        let dir = Path::new(&dir).join("Silk").join("logs");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            if let Ok(mut f) =
-                std::fs::OpenOptions::new().create(true).append(true).open(dir.join("silkreg.log"))
-            {
-                let _ = writeln!(f, "{line}");
-            }
-        }
+    crate::logger::init();
+    let scope_name = format!("{scope:?}");
+    if ok {
+        log::info!(action, scope = scope_name.as_str(), detail; "注册操作完成");
+    } else {
+        log::error!(action, scope = scope_name.as_str(), detail; "注册操作失败");
     }
+    let line = format!("{action} scope={scope_name} ok={ok} {detail}");
     if !ok {
         let text = util::utf16z(&line);
         // SAFETY: 文本 NUL 结尾且存活到调用结束；无属主窗口，MB_OK 等用户确认。

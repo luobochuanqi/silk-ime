@@ -6,10 +6,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/luobochuanqi/silk-ime/internal/ipc"
 )
 
 // candidateWindow 封装 silkui.dll 的 C ABI（契约见 06 设计）。
@@ -74,16 +77,16 @@ func cstr(s string) *byte {
 }
 
 // render 显示/刷新候选窗；preedit 与候选内容在调用内拷贝进渲染库。
-func (w *candidateWindow) render(preedit string, candidates []candidateMsg, pageIndex int, anchor silkRect, owner uintptr) {
+func (w *candidateWindow) render(v *candidateView, anchor silkRect, owner uintptr) {
 	if w == nil {
 		return
 	}
-	cands := make([]silkCandidate, len(candidates))
-	for i, c := range candidates {
+	cands := make([]silkCandidate, len(v.candidates))
+	for i, c := range v.candidates {
 		cands[i] = silkCandidate{text: cstr(c.Text), comment: cstr(c.Comment)}
 	}
-	pre := cstr(preedit)
-	view := silkView{preedit: pre, candidates: unsafe.SliceData(cands), count: int32(len(cands)), pageIndex: int32(pageIndex)}
+	pre := cstr(v.preedit)
+	view := silkView{preedit: pre, candidates: unsafe.SliceData(cands), count: int32(len(cands)), pageIndex: int32(v.pageIndex)}
 	syscall.SyscallN(w.show, uintptr(unsafe.Pointer(&view)), uintptr(unsafe.Pointer(&anchor)), owner)
 	runtime.KeepAlive(cands)
 	runtime.KeepAlive(pre)
@@ -101,4 +104,66 @@ func (w *candidateWindow) hideWindow() {
 		return
 	}
 	syscall.SyscallN(w.hide)
+}
+
+// candidateView 是一帧候选窗内容。
+type candidateView struct {
+	sid        string
+	preedit    string
+	candidates []ipc.Candidate
+	pageIndex  int
+}
+
+// viewKey 标识候选窗的归属会话：sid 只在连接内唯一，须与连接 id 组合。
+type viewKey struct {
+	conn uint64
+	sid  string
+}
+
+// presenter 是所有连接共享的唯一候选窗。窗口只属于最近一次显示它的会话：
+// 其他会话的隐藏/移动请求不生效，避免后台连接的迟到响应关掉前台候选窗。
+// silkui 内部把调用串行到自建 UI 线程，任意 goroutine 可调；这里的锁只保护归属状态。
+type presenter struct {
+	w *candidateWindow // 为 nil 时无窗运行
+
+	mu    sync.Mutex
+	owner viewKey
+	shown bool
+}
+
+func (p *presenter) show(k viewKey, v *candidateView, anchor silkRect, hwnd uintptr) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.w.render(v, anchor, hwnd)
+	p.owner, p.shown = k, true
+}
+
+// move 移动 k 所属的已显示窗口；窗口不属于 k 或未显示时返回 false。
+func (p *presenter) move(k viewKey, anchor silkRect) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.shown || p.owner != k {
+		return false
+	}
+	p.w.moveAnchor(anchor)
+	return true
+}
+
+func (p *presenter) hide(k viewKey) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.shown && p.owner == k {
+		p.w.hideWindow()
+		p.shown = false
+	}
+}
+
+// release 在连接断开时收回其窗口。
+func (p *presenter) release(conn uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.shown && p.owner.conn == conn {
+		p.w.hideWindow()
+		p.shown = false
+	}
 }

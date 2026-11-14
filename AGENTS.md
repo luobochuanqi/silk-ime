@@ -25,8 +25,12 @@
 
 ## 提交约定
 
-- 提交信息与 PR 标题采用 Conventional Commits：`类型: 中文主题`，类型限定 `feat`/`fix`/`docs`/`refactor`/`perf`/`test`/`chore`，可选 scope；squash 合并下 PR 标题即主干提交信息，release-please 据此维护 CHANGELOG 与版本发布。
+- 提交信息与 PR 标题采用 Conventional Commits：`类型: 中文主题`，类型限定 `feat`/`fix`/`docs`/`refactor`/`perf`/`test`/`chore`，可选 scope；squash 合并下 PR 标题即主干提交信息。
 - 主题表达意图而非改动清单；破坏性变更在正文以 `BREAKING CHANGE: ` 标注。
+
+## 发布
+
+- 版本发布由 release-please 自动化：依据 Conventional Commits 生成 CHANGELOG 与版本号并维护 release PR；`CHANGELOG.md` 与 `.release-please-manifest.json` 中的版本号只由它更新，手动勿改。
 
 ## 操作规范
 

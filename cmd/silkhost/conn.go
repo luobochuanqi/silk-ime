@@ -1,147 +1,114 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"net"
+	"runtime/debug"
+	"time"
 
 	"github.com/luobochuanqi/silk-ime/internal/engine"
 	"github.com/luobochuanqi/silk-ime/internal/ipc"
+	"github.com/luobochuanqi/silk-ime/internal/logging"
 	"github.com/luobochuanqi/silk-ime/internal/session"
 )
 
-// 协议消息载荷（线格式契约见 docs/design/foundation/04-process-and-ipc.md）。
+// slowRequest 是单次请求处理的告警阈值：shim 的硬超时是 30 ms，host 侧占用超过
+// 三分之一预算就值得在默认级别留痕。
+const slowRequest = 10 * time.Millisecond
 
-type helloMsg struct {
-	V     int    `json:"v"`
-	Caps  uint32 `json:"caps"`
-	Build string `json:"build"`
-}
-
-type cfgSnapshot struct {
-	PageSize  int  `json:"page_size"`
-	Chinese   bool `json:"chinese"`
-	FullPunct bool `json:"full_punct"`
-}
-
-type welcomeMsg struct {
-	V   int         `json:"v"`
-	Cfg cfgSnapshot `json:"cfg"`
-}
-
-type modeMsg struct {
-	Chinese   bool `json:"chinese"`
-	FullPunct bool `json:"full_punct"`
-}
-
-type focusInMsg struct {
-	App      string `json:"app"`
-	HWND     uint64 `json:"hwnd"`
-	LangHint string `json:"lang_hint"`
-}
-
-type keyMsg struct {
-	Code uint16 `json:"code"`
-	Rune string `json:"rune,omitempty"`
-	Down bool   `json:"down"`
-	Mods uint8  `json:"mods"`
-	TS   uint64 `json:"ts"`
-}
-
-type actionMsg struct {
-	Kind  string   `json:"kind"` // select | page | toggle | cancel
-	Index *int     `json:"index,omitempty"`
-	Mode  *modeMsg `json:"mode,omitempty"`
-}
-
-type candidateMsg struct {
-	Text    string `json:"text"`
-	Comment string `json:"comment,omitempty"`
-}
-
-type updateMsg struct {
-	Preedit    string         `json:"preedit"`
-	Caret      int            `json:"caret"`
-	Candidates []candidateMsg `json:"candidates"`
-	PageIndex  int            `json:"page_index"`
-	Mode       modeMsg        `json:"mode"`
-}
-
-type commitMsg struct {
-	Text string `json:"text"`
-}
-
-type errMsg struct {
-	ID   uint64 `json:"id"`
-	Code int    `json:"code"`
-	Msg  string `json:"msg"`
-}
-
-type pingMsg struct {
-	TS uint64 `json:"ts"`
-}
-
-type rectMsg struct {
-	X int32 `json:"x"`
-	Y int32 `json:"y"`
-	W int32 `json:"w"`
-	H int32 `json:"h"`
-}
-
-type caretMsg struct {
-	Rect rectMsg `json:"rect"`
-}
-
-// conn 是单条 shim 连接的协议处理器；读循环即该连接全部会话的串行调用方。
+// conn 是单条 shim 连接的协议处理器。读循环是该连接全部会话的唯一调用方，
+// 除 ui（跨连接共享）外的字段都无需加锁。
+//
+// 应答约定（04）：同一请求的应答帧都回带请求 id，先 commit（如有）后 update；
+// update 或 error 是应答的最后一帧，shim 据此判定应答结束，不依赖时序。
 type conn struct {
-	nc         net.Conn
-	mgr        *session.Manager
-	cw         *candidateWindow
-	snapshot   cfgSnapshot
+	id       uint64
+	nc       net.Conn
+	mgr      *session.Manager
+	client   *session.Client
+	ui       *presenter
+	pageSize int
+	log      *slog.Logger
+
 	handshaked bool
-	owner      uintptr
-	anchor     silkRect
-	shown      bool
+
+	// 候选窗锚点：caret 消息在按键应答之后才到，有候选但锚点未就绪的视图
+	// 暂存在 view，等 caret 到达再显示（否则每次组字的首键都不出候选窗）。
+	hwnd   uintptr
+	anchor silkRect
+	view   *candidateView
 }
 
-func (c *conn) send(typ, sid string, payload any) error {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("编码载荷 %s: %w", typ, err)
+func newConn(id uint64, nc net.Conn, mgr *session.Manager, ui *presenter, pageSize int) *conn {
+	return &conn{
+		id:       id,
+		nc:       nc,
+		mgr:      mgr,
+		client:   mgr.NewClient(),
+		ui:       ui,
+		pageSize: pageSize,
+		log:      slog.With("conn", id),
 	}
-	env := ipc.Envelope{V: ipc.Version, Type: typ, SID: sid, Payload: raw}
-	body, err := ipc.Encode(env)
-	if err != nil {
-		return fmt.Errorf("编码信封 %s: %w", typ, err)
-	}
-	return ipc.WriteFrame(c.nc, body)
 }
 
-func (c *conn) sendError(sid string, id uint64, code int, msg string) {
-	if err := c.send("error", sid, errMsg{ID: id, Code: code, Msg: msg}); err != nil {
-		log.Printf("发送 error: %v", err)
-	}
+// requestError 是可回报给 shim 的请求失败。
+type requestError struct {
+	code int
+	msg  string
+}
+
+func (e *requestError) Error() string { return e.msg }
+
+func badRequest(format string, args ...any) error {
+	return &requestError{code: ipc.CodeBadRequest, msg: fmt.Sprintf(format, args...)}
 }
 
 // run 服务一条连接直到断开或协议违规（畸形帧直接断开，见 04 安全策略）。
+// 返回前回收本连接的全部会话与候选窗归属。
 func (c *conn) run() {
-	defer c.nc.Close()
+	start := time.Now()
+	frames := 0
+	reason := "对端关闭"
+	defer func() {
+		if r := recover(); r != nil {
+			reason = "panic"
+			c.log.Error("连接处理崩溃", "panic", r, "stack", string(debug.Stack()))
+		}
+		orphans := c.client.Len()
+		c.client.Close()
+		c.ui.release(c.id)
+		c.nc.Close()
+		c.log.Info("连接关闭", "reason", reason, "frames", frames, "orphan_sessions", orphans,
+			"uptime", time.Since(start).Round(time.Second))
+	}()
+
 	for {
 		frame, err := ipc.ReadFrame(c.nc)
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				reason = err.Error()
+			}
 			return
 		}
+		frames++
 		env, err := ipc.Decode(frame)
 		if err != nil {
-			log.Printf("解码失败（断开连接）: %v", err)
+			reason = "畸形帧"
+			c.log.Warn("解码失败，断开连接", "err", err)
 			return
 		}
-		if !c.handshaked && env.Type != "hello" && env.Type != "ping" {
-			c.sendError(env.SID, env.ID, 400, "未握手")
+		if !c.handshaked && env.Type != ipc.TypeHello && env.Type != ipc.TypePing {
+			reason = "未握手"
+			c.fail(env, badRequest("未握手"))
 			return
 		}
 		if !c.dispatch(env) {
+			reason = "握手失败"
 			return
 		}
 	}
@@ -150,156 +117,220 @@ func (c *conn) run() {
 // dispatch 处理单条消息；返回 false 表示连接应关闭。
 func (c *conn) dispatch(env ipc.Envelope) bool {
 	switch env.Type {
-	case "hello":
-		var msg helloMsg
-		if err := json.Unmarshal(env.Payload, &msg); err != nil || msg.V != ipc.Version {
-			c.sendError(env.SID, env.ID, 400, "hello 版本不支持")
-			return false
-		}
-		c.handshaked = true
-		if err := c.send("welcome", "", welcomeMsg{V: ipc.Version, Cfg: c.snapshot}); err != nil {
-			log.Printf("发送 welcome: %v", err)
-		}
-
-	case "focus_in":
-		var msg focusInMsg
-		if err := json.Unmarshal(env.Payload, &msg); err != nil {
-			c.sendError(env.SID, env.ID, 400, "focus_in 载荷非法")
-			return true
-		}
-		c.mgr.FocusIn(env.SID, msg.App)
-		c.owner = uintptr(msg.HWND)
-		c.sendResponse(env.SID, engine.Response{Mode: engine.Mode{Chinese: c.snapshot.Chinese, FullPunct: c.snapshot.FullPunct}})
-
-	case "caret":
-		var msg caretMsg
-		if err := json.Unmarshal(env.Payload, &msg); err != nil {
-			c.sendError(env.SID, env.ID, 400, "caret 载荷非法")
-			return true
-		}
-		c.anchor = silkRect{x: msg.Rect.X, y: msg.Rect.Y, w: msg.Rect.W, h: msg.Rect.H}
-		// 06：窗已显示时原子移动（一次 SetWindowPos，不闪烁）。
-		if c.shown {
-			c.cw.moveAnchor(c.anchor)
-		}
-
-	case "focus_out":
-		resp, err := c.mgr.FocusOut(env.SID)
+	case ipc.TypeHello:
+		return c.hello(env)
+	case ipc.TypePing:
+		var msg ipc.Ping
+		_ = json.Unmarshal(env.Payload, &msg)
+		c.send(ipc.TypePong, env, msg)
+	case ipc.TypeCaret:
+		c.caret(env)
+	case ipc.TypeBye:
+		// bye 只结束其会话：连接由 TIP 实例跨焦点复用，断开会让下一键白白直通。
+		c.client.End(env.SID)
+		c.ui.hide(c.key(env.SID))
+	case ipc.TypeFocusIn, ipc.TypeFocusOut, ipc.TypeKey, ipc.TypeAction:
+		start := time.Now()
+		resp, err := c.request(env)
 		if err != nil {
-			c.sendError(env.SID, env.ID, 404, err.Error())
+			c.fail(env, err)
 			return true
 		}
-		c.sendResponse(env.SID, resp)
-		c.hide()
+		c.reply(env, resp)
+		c.trace(env, resp, time.Since(start))
+	default:
+		c.fail(env, badRequest("host 不接受 %s 消息", env.Type))
+	}
+	return true
+}
 
-	case "key":
-		var msg keyMsg
-		if err := json.Unmarshal(env.Payload, &msg); err != nil {
-			c.sendError(env.SID, env.ID, 400, "key 载荷非法")
-			return true
+func (c *conn) hello(env ipc.Envelope) bool {
+	var msg ipc.Hello
+	if err := json.Unmarshal(env.Payload, &msg); err != nil || msg.V != ipc.Version {
+		c.fail(env, badRequest("hello 版本不支持"))
+		return false
+	}
+	if !c.handshaked {
+		c.handshaked = true
+		c.log = c.log.With("pid", msg.PID)
+		c.log.Info("握手完成", "build", msg.Build, "caps", msg.Caps)
+	}
+	mode := c.mgr.Mode()
+	c.send(ipc.TypeWelcome, env, ipc.Welcome{V: ipc.Version, Cfg: ipc.Config{
+		PageSize:  c.pageSize,
+		Chinese:   mode.Chinese,
+		FullPunct: mode.FullPunct,
+	}})
+	return true
+}
+
+// request 把会话级请求交给引擎。
+func (c *conn) request(env ipc.Envelope) (engine.Response, error) {
+	switch env.Type {
+	case ipc.TypeFocusIn:
+		msg, err := decode[ipc.FocusIn](env)
+		if err != nil {
+			return engine.Response{}, err
 		}
-		resp, err := c.mgr.HandleKey(env.SID, engine.Key{
+		c.hwnd, c.anchor, c.view = uintptr(msg.HWND), silkRect{}, nil
+		c.log.Debug("焦点进入", "sid", env.SID, "app", msg.App)
+		return c.client.FocusIn(env.SID, msg.App), nil
+	case ipc.TypeFocusOut:
+		return c.client.FocusOut(env.SID)
+	case ipc.TypeKey:
+		msg, err := decode[ipc.Key](env)
+		if err != nil {
+			return engine.Response{}, err
+		}
+		return c.client.Handle(env.SID, engine.Event{Key: &engine.Key{
 			Code: engine.KeyCode(msg.Code),
 			Rune: firstRune(msg.Rune),
 			Down: msg.Down,
 			Mods: engine.ModMask(msg.Mods),
 			TS:   msg.TS,
-		})
+		}})
+	case ipc.TypeAction:
+		msg, err := decode[ipc.Action](env)
 		if err != nil {
-			c.sendError(env.SID, env.ID, 404, err.Error())
-			return true
+			return engine.Response{}, err
 		}
-		c.sendResponse(env.SID, resp)
-
-	case "action":
-		var msg actionMsg
-		if err := json.Unmarshal(env.Payload, &msg); err != nil {
-			c.sendError(env.SID, env.ID, 400, "action 载荷非法")
-			return true
-		}
-		resp, err := c.handleAction(env.SID, msg)
+		ev, err := actionEvent(msg)
 		if err != nil {
-			c.sendError(env.SID, env.ID, 400, err.Error())
-			return true
+			return engine.Response{}, err
 		}
-		c.sendResponse(env.SID, resp)
-
-	case "ping":
-		var msg pingMsg
-		_ = json.Unmarshal(env.Payload, &msg)
-		if err := c.send("pong", env.SID, pingMsg{TS: msg.TS}); err != nil {
-			log.Printf("发送 pong: %v", err)
-		}
-
-	case "bye":
-		return false
-
-	default:
-		c.sendError(env.SID, env.ID, 400, "未知消息类型 "+env.Type)
+		return c.client.Handle(env.SID, ev)
 	}
-	return true
+	return engine.Response{}, badRequest("非会话请求 %s", env.Type)
 }
 
-func (c *conn) handleAction(sid string, msg actionMsg) (engine.Response, error) {
+func actionEvent(msg ipc.Action) (engine.Event, error) {
 	switch msg.Kind {
-	case "select":
+	case ipc.ActionSelect:
 		if msg.Index == nil {
-			return engine.Response{}, fmt.Errorf("select 缺少 index")
+			return engine.Event{}, badRequest("select 缺少 index")
 		}
-		return c.mgr.Select(sid, *msg.Index)
-	case "page":
+		return engine.Event{Select: msg.Index}, nil
+	case ipc.ActionPage:
 		if msg.Index == nil {
-			return engine.Response{}, fmt.Errorf("page 缺少 index")
+			return engine.Event{}, badRequest("page 缺少 index")
 		}
-		return c.mgr.Page(sid, *msg.Index)
-	case "toggle":
+		return engine.Event{Page: msg.Index}, nil
+	case ipc.ActionToggle:
 		if msg.Mode == nil {
-			return engine.Response{}, fmt.Errorf("toggle 缺少 mode")
+			return engine.Event{}, badRequest("toggle 缺少 mode")
 		}
-		return c.mgr.Toggle(sid, engine.Mode{Chinese: msg.Mode.Chinese, FullPunct: msg.Mode.FullPunct})
-	case "cancel":
-		return c.mgr.HandleKey(sid, engine.Key{Code: engine.KeyEsc, Down: true, TS: 0})
-	default:
-		return engine.Response{}, fmt.Errorf("未知 action kind %q", msg.Kind)
+		return engine.Event{Toggle: &engine.Mode{Chinese: msg.Mode.Chinese, FullPunct: msg.Mode.FullPunct}}, nil
+	case ipc.ActionCancel:
+		return engine.Event{Key: &engine.Key{Code: engine.KeyEsc, Down: true}}, nil
 	}
+	return engine.Event{}, badRequest("未知 action kind %q", msg.Kind)
 }
 
-// sendResponse 把引擎响应拆为 update（总是）与 commit（有上屏时）两条消息，
-// 并驱动候选窗可见性（06 状态机：有候选且 caret 有效显示，commit/空候选/失焦隐藏）。
-func (c *conn) sendResponse(sid string, resp engine.Response) {
-	cands := make([]candidateMsg, 0, len(resp.Candidates))
-	for _, cd := range resp.Candidates {
-		cands = append(cands, candidateMsg{Text: cd.Text, Comment: cd.Comment})
+// reply 发出应答（commit 在前、update 收尾）并驱动候选窗可见性。
+func (c *conn) reply(env ipc.Envelope, resp engine.Response) {
+	cands := make([]ipc.Candidate, len(resp.Candidates))
+	for i, cd := range resp.Candidates {
+		cands[i] = ipc.Candidate{Text: cd.Text, Comment: cd.Comment}
 	}
-	if err := c.send("update", sid, updateMsg{
+	if resp.Commit != "" {
+		c.send(ipc.TypeCommit, env, ipc.Commit{Text: resp.Commit})
+	}
+	c.send(ipc.TypeUpdate, env, ipc.Update{
 		Preedit:    resp.Preedit,
 		Caret:      resp.Caret,
 		Candidates: cands,
 		PageIndex:  resp.PageIndex,
-		Mode:       modeMsg{Chinese: resp.Mode.Chinese, FullPunct: resp.Mode.FullPunct},
-	}); err != nil {
-		log.Printf("发送 update: %v", err)
-	}
-	if resp.Commit != "" {
-		if err := c.send("commit", sid, commitMsg{Text: resp.Commit}); err != nil {
-			log.Printf("发送 commit: %v", err)
-		}
-		c.hide()
+		Mode:       ipc.Mode{Chinese: resp.Mode.Chinese, FullPunct: resp.Mode.FullPunct},
+	})
+
+	k := c.key(env.SID)
+	if len(cands) == 0 || env.Type == ipc.TypeFocusOut {
+		c.view = nil
+		c.ui.hide(k)
 		return
 	}
-	// 06:43：坐标过期（无有效 caret）时隐藏而非渲染。
-	if len(cands) > 0 && c.anchor.w > 0 && c.anchor.h > 0 {
-		c.cw.render(resp.Preedit, cands, resp.PageIndex, c.anchor, c.owner)
-		c.shown = true
-		return
+	c.view = &candidateView{sid: env.SID, preedit: resp.Preedit, candidates: cands, pageIndex: resp.PageIndex}
+	// 06：坐标未就绪（无有效 caret）时不在错误位置显示，等 caret 到达。
+	if c.anchor.w > 0 && c.anchor.h > 0 {
+		c.ui.show(k, c.view, c.anchor, c.hwnd)
 	}
-	c.hide()
 }
 
-// hide 隐藏候选窗并同步可见性状态（06 可见性状态机）。
-func (c *conn) hide() {
-	c.cw.hideWindow()
-	c.shown = false
+// caret 更新锚点：窗口已显示则原子移动（一次 SetWindowPos，不闪烁），
+// 有待显示的视图则就地显示。
+func (c *conn) caret(env ipc.Envelope) {
+	msg, err := decode[ipc.Caret](env)
+	if err != nil {
+		c.log.Warn("caret 载荷非法", "err", err)
+		return
+	}
+	c.anchor = silkRect{x: msg.Rect.X, y: msg.Rect.Y, w: msg.Rect.W, h: msg.Rect.H}
+	if c.view == nil || c.view.sid != env.SID || c.anchor.w <= 0 || c.anchor.h <= 0 {
+		return
+	}
+	k := c.key(env.SID)
+	if !c.ui.move(k, c.anchor) {
+		c.ui.show(k, c.view, c.anchor, c.hwnd)
+	}
+}
+
+func (c *conn) key(sid string) viewKey {
+	return viewKey{conn: c.id, sid: sid}
+}
+
+// send 发送一帧应答，回带请求的 id 与 sid。写失败意味着连接已断，读循环随后退出。
+func (c *conn) send(typ string, req ipc.Envelope, payload any) {
+	raw, err := json.Marshal(payload)
+	if err == nil {
+		var frame []byte
+		frame, err = ipc.Encode(ipc.Envelope{V: ipc.Version, ID: req.ID, Type: typ, SID: req.SID, Payload: raw})
+		if err == nil {
+			err = ipc.WriteFrame(c.nc, frame)
+		}
+	}
+	if err != nil {
+		c.log.Warn("发送失败", "type", typ, "id", req.ID, "err", err)
+	}
+}
+
+func (c *conn) fail(env ipc.Envelope, err error) {
+	code := ipc.CodeBadRequest
+	var re *requestError
+	switch {
+	case errors.As(err, &re):
+		code = re.code
+	case errors.Is(err, session.ErrUnknownSession):
+		code = ipc.CodeUnknownSession
+	}
+	c.log.Warn("请求失败", "type", env.Type, "sid", env.SID, "id", env.ID, "code", code, "err", err)
+	c.send(ipc.TypeError, env, ipc.Error{ID: env.ID, Code: code, Msg: err.Error()})
+}
+
+// trace 记录单次请求：debug 级别逐条记录，超过 slowRequest 时以 warn 留痕。
+func (c *conn) trace(env ipc.Envelope, resp engine.Response, dur time.Duration) {
+	level := slog.LevelDebug
+	if dur >= slowRequest {
+		level = slog.LevelWarn
+	}
+	if !c.log.Enabled(context.Background(), level) {
+		return
+	}
+	attrs := []any{
+		"type", env.Type, "sid", env.SID, "id", env.ID, "dur", dur,
+		logging.Text("preedit", resp.Preedit), "cands", len(resp.Candidates), "page", resp.PageIndex,
+	}
+	if resp.Commit != "" {
+		attrs = append(attrs, logging.Text("commit", resp.Commit))
+	}
+	c.log.Log(context.Background(), level, "请求", attrs...)
+}
+
+func decode[T any](env ipc.Envelope) (T, error) {
+	var v T
+	if err := json.Unmarshal(env.Payload, &v); err != nil {
+		return v, badRequest("%s 载荷非法: %v", env.Type, err)
+	}
+	return v, nil
 }
 
 func firstRune(s string) rune {

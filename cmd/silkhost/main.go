@@ -6,12 +6,14 @@ package main
 import (
 	"errors"
 	"flag"
-	"io"
-	"log"
+	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,45 +22,64 @@ import (
 
 	"github.com/luobochuanqi/silk-ime/internal/config"
 	"github.com/luobochuanqi/silk-ime/internal/engine"
+	"github.com/luobochuanqi/silk-ime/internal/logging"
 	"github.com/luobochuanqi/silk-ime/internal/session"
 )
 
+// maintenanceInterval 同时决定用户词频落盘周期（崩溃最多丢这么久的增量）与空闲检查粒度。
+const maintenanceInterval = 30 * time.Second
+
 func main() {
+	if err := run(); err != nil {
+		slog.Error("silkhost 异常退出", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	var (
 		cfgPath  = flag.String("config", "", "配置文件路径（默认 %LOCALAPPDATA%\\Silk\\silk.toml）")
 		dictPath = flag.String("dict", "dict/silk.dict", "词库文件路径")
 		pipeName = flag.String("pipe", "", "管道名（默认 \\\\.\\pipe\\silk-ime-<SID>）")
 	)
 	flag.Parse()
-	log.SetPrefix("silkhost ")
-	declareDPIAwareness()
 
 	paths, err := config.DefaultPaths()
 	if err != nil {
-		log.Fatalf("数据目录: %v", err)
+		return err
 	}
 	if *cfgPath != "" {
 		paths.Config = *cfgPath
 	}
-	cfg, err := config.Load(paths.Config)
+	// 配置损坏不阻止启动：host 起不来等于输入法整体失效，按默认值降级并告警。
+	cfg, cfgErr := config.Load(paths.Config)
+
+	_, logFile, err := logging.Setup(logging.Options{
+		Path:     filepath.Join(paths.Logs, "silkhost.log"),
+		Level:    cfg.LogLevel,
+		MaxBytes: 2 << 20,
+		Backups:  4,
+		Console:  stderrAttached(),
+	})
 	if err != nil {
-		log.Fatalf("配置: %v", err)
+		slog.Warn("日志文件不可用，仅输出到 stderr", "err", err)
+	} else {
+		defer logFile.Close()
 	}
-	// ponytail: 日志仅追加不滚动；M2 按 08 设计做 5×2MB 滚动与脱敏结构化
-	if err := os.MkdirAll(paths.Logs, 0o755); err == nil {
-		if f, err := os.OpenFile(filepath.Join(paths.Logs, "silkhost.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
-			defer f.Close()
-			log.SetOutput(io.MultiWriter(os.Stderr, f))
-		}
+	slog.Info("silkhost 启动", "version", buildVersion(), "pid", os.Getpid(), "data", paths.Dir)
+	if cfgErr != nil {
+		slog.Error("配置无效，使用默认配置", "path", paths.Config, "err", cfgErr)
 	}
+	declareDPIAwareness()
 
 	dictData, err := os.ReadFile(*dictPath)
 	if err != nil {
-		log.Fatalf("词库 %s: %v", *dictPath, err)
+		return fmt.Errorf("读取词库: %w", err)
 	}
 	userEntries, err := session.LoadUserEntries(paths.UserDict)
 	if err != nil {
-		log.Fatalf("用户词库: %v", err)
+		// 落盘时会再次读取并失败，增量留在内存，不会覆盖读不出来的用户词库。
+		slog.Error("用户词库不可读，本次不加载", "path", paths.UserDict, "err", err)
 	}
 	eng, err := engine.Open(dictData, userEntries, engine.Config{
 		PageSize:          cfg.PageSize,
@@ -66,19 +87,60 @@ func main() {
 		EnglishCompletion: cfg.EnglishCompletion,
 	})
 	if err != nil {
-		log.Fatalf("引擎: %v", err)
+		return fmt.Errorf("打开引擎: %w", err)
 	}
+	slog.Info("引擎就绪", "dict", *dictPath, "user_entries", len(userEntries), "page_size", cfg.PageSize)
 	mgr := session.NewManager(eng, paths.UserDict)
+
 	cw, err := loadCandidateWindow()
 	if err != nil {
-		log.Printf("候选窗不可用（无窗模式）: %v", err)
+		slog.Warn("候选窗不可用，以无窗模式运行", "err", err)
+	}
+	ui := &presenter{w: cw}
+
+	ln, err := listen(*pipeName)
+	if errors.Is(err, errAlreadyRunning) {
+		slog.Info("已有实例运行，退出")
+		return nil
+	}
+	if err != nil {
+		return err
 	}
 
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+	go serve(ln, mgr, ui, cfg.PageSize)
+
+	defer flush(mgr)
+	idle := time.Duration(cfg.IdleExitMinutes) * time.Minute
+	tick := time.NewTicker(maintenanceInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case sig := <-shutdown:
+			slog.Info("收到退出信号", "signal", sig)
+			ln.Close()
+			return nil
+		case <-tick.C:
+			flush(mgr)
+			// 无会话空闲超过阈值退出（连接常驻不算活动）。
+			if mgr.ActiveSessions() == 0 && time.Since(mgr.LastUse()) > idle {
+				slog.Info("空闲超时，退出", "idle", idle)
+				ln.Close()
+				return nil
+			}
+		}
+	}
+}
+
+var errAlreadyRunning = errors.New("已有实例运行")
+
+// listen 创建当前用户的协议管道；管道已存在即说明已有实例（ADR-5 单实例保证）。
+func listen(name string) (net.Listener, error) {
 	sid, err := currentUserSID()
 	if err != nil {
-		log.Fatalf("当前用户 SID: %v", err)
+		return nil, fmt.Errorf("当前用户 SID: %w", err)
 	}
-	name := *pipeName
 	if name == "" {
 		name = `\\.\pipe\silk-ime-` + sid
 	}
@@ -92,65 +154,50 @@ func main() {
 		OutputBufferSize: 64 << 10,
 	})
 	if err != nil {
-		// 管道被占用 = 已有实例在运行（ADR-5 单实例保证），静默退出。
-		if errors.Is(err, windows.ERROR_PIPE_BUSY) {
-			log.Print("已有实例运行，退出")
-			return
+		// 首实例以 FILE_CREATE 创建管道：同名已存在时报 ALREADY_EXISTS（或拒绝访问）。
+		if errors.Is(err, windows.ERROR_ALREADY_EXISTS) || errors.Is(err, windows.ERROR_PIPE_BUSY) ||
+			errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return nil, errAlreadyRunning
 		}
-		log.Fatalf("监听管道 %s: %v", name, err)
+		return nil, fmt.Errorf("监听管道 %s: %w", name, err)
 	}
-	log.Printf("就绪：%s", name)
+	slog.Info("管道就绪", "pipe", name)
+	return ln, nil
+}
 
-	shutdown := make(chan struct{})
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		<-sig
-		close(shutdown)
-		ln.Close()
-	}()
-
-	go func() {
-		for {
-			nc, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(nc net.Conn) {
-				log.Print("接受 shim 连接")
-				c := &conn{nc: nc, mgr: mgr, cw: cw, snapshot: cfgSnapshot{
-					PageSize:  cfg.PageSize,
-					Chinese:   true,
-					FullPunct: true,
-				}}
-				c.run()
-			}(nc)
-		}
-	}()
-
-	idle := time.Duration(cfg.IdleExitMinutes) * time.Minute
-	tick := time.NewTicker(30 * time.Second)
-	defer tick.Stop()
+// serve 接受 shim 连接直到监听器关闭，每条连接一个读循环。
+func serve(ln net.Listener, mgr *session.Manager, ui *presenter, pageSize int) {
+	var ids atomic.Uint64
 	for {
-		select {
-		case <-shutdown:
-			shutdownHost(mgr)
-			return
-		case <-tick.C:
-			// 04:110：无会话空闲超过阈值退出（连接常驻不算活动）。
-			if mgr.ActiveSessions() == 0 && time.Since(mgr.LastUse()) > idle {
-				log.Print("空闲超时，退出")
-				shutdownHost(mgr)
-				return
+		nc, err := ln.Accept()
+		if err != nil {
+			if !errors.Is(err, winio.ErrPipeListenerClosed) {
+				slog.Error("接受连接失败，停止服务", "err", err)
 			}
+			return
 		}
+		go newConn(ids.Add(1), nc, mgr, ui, pageSize).run()
 	}
 }
 
-func shutdownHost(mgr *session.Manager) {
-	if err := mgr.Close(); err != nil {
-		log.Printf("落盘用户词库: %v", err)
+func flush(mgr *session.Manager) {
+	if err := mgr.Flush(); err != nil {
+		slog.Error("用户词库落盘失败，增量保留待重试", "err", err)
 	}
+}
+
+func buildVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		return info.Main.Version
+	}
+	return "unknown"
+}
+
+// stderrAttached 判断进程是否有可用的 stderr（前台调试运行）。shim 以 CREATE_NO_WINDOW
+// 拉起时标准句柄为空。
+func stderrAttached() bool {
+	_, err := os.Stderr.Stat()
+	return err == nil
 }
 
 // declareDPIAwareness 声明 per-monitor DPI aware v2（06:50：host 进程声明，

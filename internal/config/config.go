@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/luobochuanqi/silk-ime/internal/logging"
 )
 
 // Config 是 silk.toml 的全部配置项。
@@ -16,6 +18,8 @@ type Config struct {
 	FuzzyGroups       [][]string `toml:"fuzzy_groups"`
 	EnglishCompletion bool       `toml:"english_completion"`
 	IdleExitMinutes   int        `toml:"idle_exit_minutes"`
+	// LogLevel 为 debug/info/warn/error；环境变量 SILK_LOG 优先。
+	LogLevel string `toml:"log_level"`
 }
 
 // Paths 是用户数据目录布局，整个目录可复制迁移（产品契约，见 05 设计）。
@@ -50,7 +54,8 @@ func DefaultPaths() (Paths, error) {
 	}, nil
 }
 
-// Load 读取配置文件；文件不存在返回默认配置。解析失败或非法值返回错误。
+// Load 读取配置文件；文件不存在返回默认配置。解析失败或非法值返回错误，
+// 同时返回默认配置，调用方可降级运行。
 func Load(path string) (Config, error) {
 	cfg := Default()
 	data, err := os.ReadFile(path)
@@ -58,13 +63,13 @@ func Load(path string) (Config, error) {
 		return cfg, nil
 	}
 	if err != nil {
-		return cfg, fmt.Errorf("读取配置: %w", err)
+		return Default(), fmt.Errorf("读取配置: %w", err)
 	}
 	if err := toml.Unmarshal(data, &cfg); err != nil {
-		return cfg, fmt.Errorf("解析配置 %s: %w", path, err)
+		return Default(), fmt.Errorf("解析配置 %s: %w", path, err)
 	}
 	if err := cfg.validate(); err != nil {
-		return cfg, err
+		return Default(), err
 	}
 	return cfg, nil
 }
@@ -80,6 +85,9 @@ func (c Config) validate() error {
 	}
 	if c.IdleExitMinutes < 1 {
 		return fmt.Errorf("idle_exit_minutes=%d 必须为正", c.IdleExitMinutes)
+	}
+	if _, err := logging.ParseLevel(c.LogLevel); err != nil {
+		return fmt.Errorf("log_level: %w", err)
 	}
 	return nil
 }

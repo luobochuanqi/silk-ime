@@ -6,7 +6,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 use silk_protocol::{
-    Envelope, TYPE_ACTION, TYPE_BYE, TYPE_CARET, TYPE_FOCUS_IN, TYPE_FOCUS_OUT, TYPE_HELLO,
+    Envelope, TYPE_ACTION, TYPE_CARET, TYPE_FOCUS_IN, TYPE_FOCUS_OUT, TYPE_HELLO,
     TYPE_KEY, TYPE_PING, TYPE_UPDATE, TYPE_WELCOME, VERSION,
 };
 
@@ -84,8 +84,14 @@ fn envelope(id: u64, type_: &str, sid: Option<&str>, payload: Value) -> Envelope
     }
 }
 
+/// 握手。`pid` 让 host 日志能与本进程的 tsftip 日志对上号。
 pub fn hello() -> Envelope {
-    envelope(0, TYPE_HELLO, None, json!({ "v": VERSION, "caps": CAPS, "build": BUILD }))
+    envelope(
+        0,
+        TYPE_HELLO,
+        None,
+        json!({ "v": VERSION, "caps": CAPS, "build": BUILD, "pid": std::process::id() }),
+    )
 }
 
 pub fn focus_in(id: u64, sid: &str, app: &str, hwnd: u64) -> Envelope {
@@ -99,10 +105,6 @@ pub fn focus_in(id: u64, sid: &str, app: &str, hwnd: u64) -> Envelope {
 
 pub fn focus_out(id: u64, sid: &str) -> Envelope {
     envelope(id, TYPE_FOCUS_OUT, Some(sid), json!({}))
-}
-
-pub fn bye(sid: &str) -> Envelope {
-    envelope(0, TYPE_BYE, Some(sid), json!({}))
 }
 
 pub fn key(id: u64, sid: &str, code: u16, rune: Option<char>, down: bool, mods: u8, ts: u64) -> Envelope {
@@ -349,14 +351,12 @@ mod tests {
     }
 
     #[test]
-    fn bye_and_focus_out_require_sid() {
-        let env = bye("s-1");
-        assert_eq!(env.payload, json!({}));
-        env.validate().expect("bye 合法");
+    fn focus_out_requires_sid() {
         let env = focus_out(2, "s-1");
+        assert_eq!(env.payload, json!({}));
         env.validate().expect("focus_out 合法");
         // 缺 sid 的会话级消息必须被协议层拒绝。
-        let mut bad = bye("s-1");
+        let mut bad = focus_out(2, "s-1");
         bad.sid = None;
         assert!(bad.validate().is_err());
     }

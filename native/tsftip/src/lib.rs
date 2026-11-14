@@ -7,6 +7,7 @@
 mod client;
 mod edit;
 mod key;
+mod logger;
 mod msg;
 mod reg;
 mod session;

@@ -184,6 +184,7 @@ fn spec_for(type_: &str) -> Option<MessageSpec> {
         ("v", Field::required(Kind::Number)),
         ("caps", Field::required(Kind::Number)),
         ("build", Field::required(Kind::String)),
+        ("pid", Field::optional(Kind::Number)),
     ];
     const WELCOME: &[(&str, Field)] = &[
         ("v", Field::required(Kind::Number)),

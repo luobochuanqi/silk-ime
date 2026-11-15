@@ -1,11 +1,12 @@
 //! TSF 注册与注销（SilkRegister / SilkUnregister 的实现）。
 //!
 //! 两类注册（03）：COM in-proc server 写注册表，TIP profile/类别走 TSF 管理接口。
-//! 全程幂等：重复注册不产生重复 profile，重复注销不报错。
+//! 重复注册不产生重复 profile；注销仅把明确的缺失错误视为幂等成功。
 
 use std::path::Path;
 
-use windows::core::{w, GUID, Interface, PCWSTR};
+use windows::core::{Interface, GUID};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
@@ -13,12 +14,11 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::TextServices::{
-    ITfCategoryMgr, ITfInputProcessorProfileMgr, ITfInputProcessorProfiles, CLSID_TF_CategoryMgr,
-    CLSID_TF_InputProcessorProfiles, GUID_TFCAT_TIP_KEYBOARD, GUID_TFCAT_TIPCAP_COMLESS,
+    CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr,
+    ITfInputProcessorProfileMgr, ITfInputProcessorProfiles, GUID_TFCAT_TIPCAP_COMLESS,
     GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
-    GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+    GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, GUID_TFCAT_TIPCAP_UIELEMENTENABLED, GUID_TFCAT_TIP_KEYBOARD,
 };
-use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
 
 use crate::util;
 
@@ -100,9 +100,7 @@ impl ComGuard {
         // SAFETY: rundll32 线程可能已初始化 COM（S_FALSE）或处于别的套间模式
         // （RPC_E_CHANGED_MODE）；两种可接受情形都不需要配对 CoUninitialize。
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        ComGuard {
-            uninit: hr.is_ok(),
-        }
+        ComGuard { uninit: hr.is_ok() }
     }
 }
 
@@ -200,7 +198,12 @@ fn register_categories() -> bool {
 pub fn register_machine() -> bool {
     let _guard = ComGuard::enter();
     let Some(dir) = util::module_dir() else {
-        report(Scope::Machine, "register_machine", "module_dir 不可用", false);
+        report(
+            Scope::Machine,
+            "register_machine",
+            "module_dir 不可用",
+            false,
+        );
         return false;
     };
     // 用真实模块路径而不是拼文件名：cargo 产物名与安装名可能不同（见 README 的改名步骤）。
@@ -212,7 +215,10 @@ pub fn register_machine() -> bool {
     report(
         Scope::Machine,
         "register_machine",
-        &format!("dir={} com={com} profile={profile} cats={cats}", dir.display()),
+        &format!(
+            "dir={} com={com} profile={profile} cats={cats}",
+            dir.display()
+        ),
         ok,
     );
     ok
@@ -224,13 +230,17 @@ pub fn register_machine() -> bool {
 pub fn register_user() -> bool {
     let _guard = ComGuard::enter();
     let Some(profiles) = profiles() else {
-        report(Scope::User, "register_user", "ITfInputProcessorProfiles 不可用", false);
+        report(
+            Scope::User,
+            "register_user",
+            "ITfInputProcessorProfiles 不可用",
+            false,
+        );
         return false;
     };
     // SAFETY: profiles 有效；GUID/CLSID 为静态常量，本调用只改用户级启用位。
     let enable = unsafe {
-        profiles
-            .EnableLanguageProfile(&CLSID_SILK_TIP, LANGID_ZH_CN, &GUID_SILK_PROFILE, true)
+        profiles.EnableLanguageProfile(&CLSID_SILK_TIP, LANGID_ZH_CN, &GUID_SILK_PROFILE, true)
     }
     .is_ok();
     let list = add_user_language_list();
@@ -272,20 +282,19 @@ fn add_user_language_list() -> bool {
 fn remove_user_language_list() -> bool {
     let name = user_list_value_name();
     let mut entries = util::enum_dword_values(HKEY_CURRENT_USER, USER_LIST_SUBKEY);
-    let had = entries.iter().any(|(n, _)| *n == name);
     entries.retain(|(n, _)| *n != name);
-    let ok = if had {
-        util::delete_value(HKEY_CURRENT_USER, USER_LIST_SUBKEY, &name)
-    } else {
-        true
-    };
+    // 枚举失败也必须尝试删除，由删除 API 区分缺失与权限错误。
+    let ok = util::delete_value(HKEY_CURRENT_USER, USER_LIST_SUBKEY, &name);
     write_user_list(&entries) && ok
 }
 
 fn write_user_list(entries: &[(String, u32)]) -> bool {
     let mut sorted: Vec<&(String, u32)> = entries.iter().collect();
     sorted.sort_by_key(|(_, v)| *v);
-    let contiguous = sorted.iter().enumerate().all(|(i, (_, v))| *v == i as u32 + 1);
+    let contiguous = sorted
+        .iter()
+        .enumerate()
+        .all(|(i, (_, v))| *v == i as u32 + 1);
     let mut ok = true;
     for (i, (name, value)) in sorted.iter().enumerate() {
         let data = if contiguous { *value } else { i as u32 + 1 };
@@ -294,33 +303,126 @@ fn write_user_list(entries: &[(String, u32)]) -> bool {
     ok
 }
 
-/// 机器级反注册（提权）：类别 → profile → COM 逆序清理，幂等。
+fn tip_key() -> String {
+    format!(
+        r"Software\Microsoft\CTF\TIP\{}",
+        format_guid(&CLSID_SILK_TIP)
+    )
+}
+
+fn profile_key() -> String {
+    format!(
+        r"{}\LanguageProfile\0x00000804\{}",
+        tip_key(),
+        format_guid(&GUID_SILK_PROFILE),
+    )
+}
+
+// 只有明确的不存在状态才能证明清理完成；拒绝访问等查询失败不能冒充缺失。
+fn key_absent(root: HKEY, path: &str) -> bool {
+    use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, KEY_READ};
+    let path = util::utf16z(path);
+    let mut key = HKEY::default();
+    // SAFETY: 路径以 NUL 结尾，key 是本栈独占的输出句柄。
+    let status = unsafe { RegOpenKeyExW(root, util::pcwstr(&path), Some(0), KEY_READ, &mut key) };
+    if status.is_ok() {
+        // SAFETY: key 由本次调用打开，且不再使用。
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+        return false;
+    }
+    if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+        return true;
+    }
+    crate::logger::init();
+    log::error!(error = status.0; "无法确认注销注册项是否缺失");
+    false
+}
+
+fn category_absent(catid: &GUID) -> bool {
+    let tip = format_guid(&CLSID_SILK_TIP);
+    let category = format_guid(catid);
+    let base = tip_key();
+    // TSF 同时维护正向与反向索引，任何一项残留都不算注销完成。
+    key_absent(
+        HKEY_LOCAL_MACHINE,
+        &format!(r"{base}\Category\Category\{category}\{tip}"),
+    ) && key_absent(
+        HKEY_LOCAL_MACHINE,
+        &format!(r"{base}\Category\Item\{tip}\{category}"),
+    )
+}
+
+// TSF 对缺失项也可能返回 E_FAIL；失败后查验精确归属项，不能仅凭 HRESULT 忽略错误。
+fn unregister_result(
+    action: &str,
+    result: windows::core::Result<()>,
+    absent: impl FnOnce() -> bool,
+) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            if absent() {
+                return true;
+            }
+            log::error!(action, error = error.code().0; "注销接口调用失败");
+            false
+        }
+    }
+}
+
+/// unregister_machine 按类别、profile、COM 的逆序清理，保留各步骤的真实失败。
 pub fn unregister_machine() -> bool {
     let _guard = ComGuard::enter();
+    let mut cats;
     if let Some(mgr) = categories() {
-        // SAFETY: mgr 有效；撤销「项不存在」属于幂等成功，与注册时的失败语义对称
-        // （03:46：重复注销不报错），因此这里不计入 ok。
-        unsafe {
-            for catid in categories_list() {
-                let _ = mgr.UnregisterCategory(&CLSID_SILK_TIP, &catid, &CLSID_SILK_TIP);
-            }
-        }
-    }
-    if let Some(profiles) = profiles() {
-        // SAFETY: 同上，两类撤销都按幂等处理：不存在的 profile 撤销失败不是错误。
-        unsafe {
-            let _ = profiles.RemoveLanguageProfile(
-                &CLSID_SILK_TIP,
-                LANGID_ZH_CN,
-                &GUID_SILK_PROFILE,
+        cats = true;
+        for catid in categories_list() {
+            // SAFETY: mgr 有效；CLSID 与类别 GUID 均为静态注册标识。
+            cats &= unregister_result(
+                "UnregisterCategory",
+                unsafe { mgr.UnregisterCategory(&CLSID_SILK_TIP, &catid, &CLSID_SILK_TIP) },
+                || category_absent(&catid),
             );
-            let _ = profiles.Unregister(&CLSID_SILK_TIP);
         }
+    } else {
+        cats = categories_list().iter().all(category_absent);
     }
-    let mut ok = unregister_com(Scope::Machine);
+    let profile;
+    if let Some(profiles) = profiles() {
+        // SAFETY: profiles 有效；标识与注册时一致，两个步骤均须执行。
+        let removed = unregister_result(
+            "RemoveLanguageProfile",
+            unsafe {
+                profiles.RemoveLanguageProfile(&CLSID_SILK_TIP, LANGID_ZH_CN, &GUID_SILK_PROFILE)
+            },
+            || key_absent(HKEY_LOCAL_MACHINE, &profile_key()),
+        );
+        // SAFETY: 同上，撤销本 TIP 的机器级注册。
+        let unregistered = unregister_result(
+            "Unregister",
+            unsafe { profiles.Unregister(&CLSID_SILK_TIP) },
+            || key_absent(HKEY_LOCAL_MACHINE, &tip_key()),
+        );
+        profile = (removed && unregistered) || key_absent(HKEY_LOCAL_MACHINE, &tip_key());
+    } else {
+        profile = key_absent(HKEY_LOCAL_MACHINE, &tip_key());
+    }
+    // 后续 TIP 注销可能已移除先前失败的类别，按最终状态确认清理结果。
+    if !cats {
+        cats = categories_list().iter().all(category_absent);
+    }
+    let com = unregister_com(Scope::Machine);
     // 历史版本写过按用户的 COM 注册，一并清理。
-    ok &= util::delete_tree(HKEY_CURRENT_USER, &clsid_key());
-    report(Scope::Machine, "unregister_machine", "", ok);
+    let legacy = util::delete_tree(HKEY_CURRENT_USER, &clsid_key());
+    let ok = cats && profile && com && legacy;
+    report(
+        Scope::Machine,
+        "unregister_machine",
+        &format!("cats={cats} profile={profile} com={com} legacy={legacy}"),
+        ok,
+    );
     ok
 }
 
@@ -328,38 +430,44 @@ pub fn unregister_machine() -> bool {
 pub fn unregister_user() -> bool {
     let _guard = ComGuard::enter();
     let list = remove_user_language_list();
-    if let Some(profiles) = profiles() {
-        // SAFETY: 同 register_user；不存在的 profile 停用失败按幂等处理。
-        let _ = unsafe {
-            profiles.EnableLanguageProfile(&CLSID_SILK_TIP, LANGID_ZH_CN, &GUID_SILK_PROFILE, false)
-        };
-    }
+    let enable = if let Some(profiles) = profiles() {
+        // SAFETY: 同 register_user；失败后需确认机器 profile 已不存在。
+        unregister_result(
+            "EnableLanguageProfile",
+            unsafe {
+                profiles.EnableLanguageProfile(
+                    &CLSID_SILK_TIP,
+                    LANGID_ZH_CN,
+                    &GUID_SILK_PROFILE,
+                    false,
+                )
+            },
+            || key_absent(HKEY_LOCAL_MACHINE, &profile_key()),
+        )
+    } else {
+        key_absent(HKEY_LOCAL_MACHINE, &profile_key())
+    };
+    // 机器 profile 已先移除时 TSF 无法停用，仍清理本用户精确归属的残留状态。
+    let user_profile = util::delete_tree(HKEY_CURRENT_USER, &tip_key());
     let install = util::delete_tree(HKEY_CURRENT_USER, r"Software\Silk");
-    let ok = list && install;
-    report(Scope::User, "unregister_user", &format!("list={list} install={install}"), ok);
+    let ok = list && enable && user_profile && install;
+    report(
+        Scope::User,
+        "unregister_user",
+        &format!("list={list} enable={enable} user_profile={user_profile} install={install}"),
+        ok,
+    );
     ok
 }
 
-/// rundll32 入口没有控制台：结果写入 silkreg.log，失败另弹窗，避免静默失败不可诊断。
+/// rundll32 入口只记录结果；交互由安装器统一处理，静默安装不得弹窗阻塞。
 fn report(scope: Scope, action: &str, detail: &str, ok: bool) {
-    use std::io::Write;
-    let line = format!("{action} scope={scope:?} ok={ok} {detail}");
-    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
-        let dir = Path::new(&dir).join("Silk").join("logs");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            if let Ok(mut f) =
-                std::fs::OpenOptions::new().create(true).append(true).open(dir.join("silkreg.log"))
-            {
-                let _ = writeln!(f, "{line}");
-            }
-        }
-    }
-    if !ok {
-        let text = util::utf16z(&line);
-        // SAFETY: 文本 NUL 结尾且存活到调用结束；无属主窗口，MB_OK 等用户确认。
-        unsafe {
-            MessageBoxW(None, PCWSTR(text.as_ptr()), w!("Silk 注册"), MB_OK | MB_ICONWARNING);
-        }
+    crate::logger::init();
+    let scope_name = format!("{scope:?}");
+    if ok {
+        log::info!(action, scope = scope_name.as_str(), detail; "注册操作完成");
+    } else {
+        log::error!(action, scope = scope_name.as_str(), detail; "注册操作失败");
     }
 }
 
@@ -389,33 +497,41 @@ pub unsafe fn cmd_arg(cmd: *const u8) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// `SilkRegister` 的实现体：machine = 机器级（提权），user = 用户级（普通权限）。
-pub fn run_register(cmd: Option<&str>) {
+/// run_register 返回指定层级的注册结果，供专用 rundll32 入口转换为退出码。
+pub fn run_register(cmd: Option<&str>) -> bool {
     match Scope::parse(cmd) {
-        Scope::Machine => {
-            let _ = register_machine();
-        }
-        Scope::User => {
-            let _ = register_user();
-        }
+        Scope::Machine => register_machine(),
+        Scope::User => register_user(),
     }
 }
 
-/// `SilkUnregister` 的实现体，与注册的层级语义对称。
-pub fn run_unregister(cmd: Option<&str>) {
+/// run_unregister 返回指定层级的注销结果，与注册的层级语义对称。
+pub fn run_unregister(cmd: Option<&str>) -> bool {
+    crate::logger::init();
     match Scope::parse(cmd) {
-        Scope::Machine => {
-            let _ = unregister_machine();
-        }
-        Scope::User => {
-            let _ = unregister_user();
-        }
+        Scope::Machine => unregister_machine(),
+        Scope::User => unregister_user(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unregister_failure_requires_confirmed_absence() {
+        use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL};
+
+        // TSF 对缺失项可能返回 E_FAIL；条目仍存在或无法确认时不得放行文件删除。
+        for (code, absent, expected) in [
+            (E_FAIL, true, true),
+            (E_FAIL, false, false),
+            (E_ACCESSDENIED, false, false),
+        ] {
+            let result = Err(windows::core::Error::from_hresult(code));
+            assert_eq!(unregister_result("unregister", result, || absent), expected);
+        }
+    }
 
     #[test]
     fn scope_parsing_is_forgiving() {

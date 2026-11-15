@@ -8,9 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use silk_protocol::Envelope;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfContext, ITfDocumentMgr, ITfThreadMgr,
-};
+use windows::Win32::UI::TextServices::{ITfComposition, ITfContext, ITfDocumentMgr, ITfThreadMgr};
 
 use crate::client::{Client, Reply, Shared};
 use crate::key::{should_consume, Decision, Mode};
@@ -97,11 +95,11 @@ impl Session {
     }
 
     /// 发送会话请求并等待最多 30 ms。返回下行消息序列。
-    pub fn request(&self, env: &Envelope, want_reply: bool) -> Reply {
-        self.client.request(env, want_reply, crate::client::KEY_TIMEOUT)
+    pub fn request(&self, env: &Envelope) -> Reply {
+        self.client.request(env, crate::client::KEY_TIMEOUT)
     }
 
-    /// 不等待回应的消息（caret/ping/bye）。
+    /// 不等待回应的消息（caret/cancel）。
     pub fn post(&self, env: &Envelope) {
         self.client.post(env);
     }
@@ -111,10 +109,11 @@ impl Session {
         self.client.warm();
     }
 
-    /// 把下行消息转成编辑意图，并同步模式缓存。
+    /// 把一次应答转成编辑意图，并同步模式缓存。
     ///
-    /// update 是全量状态快照而非增量：一批响应里只保留最后一条，早期快照
-    /// （如补发焦点产生的空 update）不得回放成「清空组字」。
+    /// 应答是 0..n 条 commit + 收尾 update（04）：先按序上屏，再应用 update。update
+    /// 是全量快照，只保留最后一条。先上屏再开新组字是 TSF 的自然顺序：commit 替换
+    /// 当前 composition 并结束它，随后的非空 preedit 另起一段 composition。
     pub fn absorb(&self, messages: &[Incoming]) -> Vec<EditIntent> {
         let mut intents = Vec::new();
         let mut last_update: Option<UpdatePayload> = None;
@@ -127,12 +126,7 @@ impl Session {
                     }
                     last_update = Some(update.clone());
                 }
-                Incoming::Commit(text) => {
-                    if let Some(update) = last_update.take() {
-                        intents.push(EditIntent::Update(update));
-                    }
-                    intents.push(EditIntent::Commit(text.clone()));
-                }
+                Incoming::Commit(text) => intents.push(EditIntent::Commit(text.clone())),
                 Incoming::Welcome(cfg) => {
                     self.shared.set_mode(cfg.chinese, cfg.full_punct);
                 }
@@ -181,6 +175,8 @@ impl Session {
         mods: u8,
         ts: u64,
     ) -> KeyOutcome {
+        let _hot = crate::logger::hot_path();
+        crate::logger::count(crate::logger::Event::Key);
         let had = { self.lock().composing() };
         let sid = { self.lock().sid.clone() };
         // 没有焦点会话：放行，按键由应用自己处理。
@@ -188,9 +184,10 @@ impl Session {
             return KeyOutcome { eaten: false };
         }
         let env = msg::key(0, &sid, code, rune, down, mods, ts);
-        let reply = self.request(&env, true);
+        let reply = self.request(&env);
         let plan = plan_from_reply(&reply, had, code);
         if plan.passthrough {
+            crate::logger::count(crate::logger::Event::Pass);
             return KeyOutcome { eaten: false };
         }
         let intents = self.absorb(&plan.messages);
@@ -205,7 +202,8 @@ impl Session {
 
     /// 选择/翻页/取消等动作不进入按键通道，同样带硬超时。
     pub fn handle_action(self: &Arc<Self>, env: &Envelope) -> bool {
-        match self.request(env, true) {
+        let _hot = crate::logger::hot_path();
+        match self.request(env) {
             Reply::Messages(messages) => {
                 let intents = self.absorb(&messages);
                 intents.iter().all(|intent| self.commit_to_edit(intent))
@@ -224,6 +222,7 @@ impl Session {
         match crate::edit::apply(self, intent) {
             Ok(()) => true,
             Err(_) => {
+                crate::logger::count(crate::logger::Event::EditError);
                 self.lock().candidates.clear();
                 false
             }
@@ -354,11 +353,11 @@ mod tests {
     }
 
     #[test]
-    fn absorb_orders_update_before_commit() {
+    fn absorb_commits_before_update() {
         let session = Session::new();
-        let intents = session.absorb(&[update("hao"), Incoming::Commit("好".to_owned())]);
-        assert!(matches!(intents[0], EditIntent::Update(_)));
-        assert!(matches!(intents[1], EditIntent::Commit(_)));
+        let intents = session.absorb(&[Incoming::Commit("好".to_owned()), update("")]);
+        assert!(matches!(intents[0], EditIntent::Commit(_)));
+        assert!(matches!(intents[1], EditIntent::Update(_)));
     }
 
     #[test]

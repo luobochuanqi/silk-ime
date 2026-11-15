@@ -1,11 +1,13 @@
-// Package session 管理输入会话：焦点进出、事件路由与用户词频落盘。
+// Package session 是引擎之上的会话运行时：按连接隔离会话、维护跨会话共享的输入模式，
+// 并负责用户词频增量的落盘。
 //
-// 会话状态的所有权在 Manager：每个会话由单一 goroutine（连接读循环）串行调用，
-// 会话内互斥锁用于隔离未来多文档并发；引擎的可变状态（用户词频增量）由引擎内部同步。
+// 所有权：Manager 进程内唯一，跨连接共享；每条 shim 连接持有一个 Client，sid 只在
+// Client 内唯一（shim 各实例独立编号，不同进程的 "s-1" 互不相干）。Client 由连接读循环
+// 串行调用，无需加锁；连接断开时 Close 回收其全部会话。
 package session
 
 import (
-	"fmt"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,33 +15,38 @@ import (
 	"github.com/luobochuanqi/silk-ime/internal/engine"
 )
 
-// Manager 维护 sid → 会话 的路由，并负责用户词频增量的定期落盘。
+// ErrUnknownSession 表示 sid 在本连接内没有对应会话（未 focus_in 或已结束）。
+var ErrUnknownSession = errors.New("未知会话")
+
+// DefaultMode 是 host 启动时的输入模式：中文、全角标点。
+var DefaultMode = engine.Mode{Chinese: true, FullPunct: true}
+
+// Manager 持有引擎与跨会话状态（输入模式、活动计数、待落盘词频）。并发安全。
 type Manager struct {
 	eng      *engine.Engine
 	userPath string
 
-	mu       sync.Mutex
-	sessions map[string]*session
-	lastUse  atomic.Int64
-}
+	active  atomic.Int64
+	lastUse atomic.Int64
 
-type session struct {
-	mu sync.Mutex
-	s  *engine.Session
+	modeMu sync.Mutex
+	mode   engine.Mode
+
+	flushMu sync.Mutex
+	// pending 是已从引擎取出但尚未成功落盘的增量；写失败时保留，下次重试。
+	pending []engine.UserEntry
 }
 
 // NewManager 创建管理器；userPath 为空表示不落盘用户词频（测试用）。
 func NewManager(eng *engine.Engine, userPath string) *Manager {
-	m := &Manager{eng: eng, userPath: userPath, sessions: make(map[string]*session)}
-	m.lastUse.Store(time.Now().UnixNano())
+	m := &Manager{eng: eng, userPath: userPath, mode: DefaultMode}
+	m.touch()
 	return m
 }
 
-// ActiveSessions 返回当前活动会话数（04：空闲自退出的判定依据）。
+// ActiveSessions 返回所有连接上的活动会话总数（空闲自退出的判定依据）。
 func (m *Manager) ActiveSessions() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.sessions)
+	return int(m.active.Load())
 }
 
 // LastUse 返回最近一次会话活动的时间。
@@ -47,104 +54,127 @@ func (m *Manager) LastUse() time.Time {
 	return time.Unix(0, m.lastUse.Load())
 }
 
+// Mode 返回当前输入模式。模式跨会话共享：在一个应用里切到英文，换到别的应用仍是英文。
+func (m *Manager) Mode() engine.Mode {
+	m.modeMu.Lock()
+	defer m.modeMu.Unlock()
+	return m.mode
+}
+
+func (m *Manager) setMode(mode engine.Mode) {
+	m.modeMu.Lock()
+	m.mode = mode
+	m.modeMu.Unlock()
+}
+
 func (m *Manager) touch() {
 	m.lastUse.Store(time.Now().UnixNano())
 }
 
-// FocusIn 为新文档创建会话；同 sid 重复进入时重建（以新文档状态为准）。
-func (m *Manager) FocusIn(sid, app string) {
-	m.touch()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.sessions[sid] = &session{s: m.eng.NewSession(engine.SessionMeta{App: app})}
+// NewClient 为一条 shim 连接创建会话命名空间。调用方必须在连接结束时调用 Close。
+func (m *Manager) NewClient() *Client {
+	return &Client{m: m, sessions: make(map[string]*engine.Session)}
 }
 
-// FocusOut 结束会话并返回引擎的收尾响应（失焦上屏策略产生的 commit）。
-func (m *Manager) FocusOut(sid string) (engine.Response, error) {
-	m.mu.Lock()
-	s, ok := m.sessions[sid]
-	if ok {
-		delete(m.sessions, sid)
-	}
-	m.mu.Unlock()
-	if !ok {
-		return engine.Response{}, fmt.Errorf("未知会话 %s", sid)
-	}
-	resp := s.dispatch(engine.Event{FocusOut: true})
-	s.s.Close()
-	return resp, nil
-}
-
-// HandleKey 路由按键事件。
-func (m *Manager) HandleKey(sid string, k engine.Key) (engine.Response, error) {
-	return m.dispatch(sid, engine.Event{Key: &k})
-}
-
-// Select 路由候选选择（0 起）。
-func (m *Manager) Select(sid string, index int) (engine.Response, error) {
-	return m.dispatch(sid, engine.Event{Select: &index})
-}
-
-// Page 路由翻页（±1）。
-func (m *Manager) Page(sid string, delta int) (engine.Response, error) {
-	return m.dispatch(sid, engine.Event{Page: &delta})
-}
-
-// Toggle 路由模式切换。
-func (m *Manager) Toggle(sid string, mode engine.Mode) (engine.Response, error) {
-	return m.dispatch(sid, engine.Event{Toggle: &mode})
-}
-
-func (m *Manager) dispatch(sid string, ev engine.Event) (engine.Response, error) {
-	m.touch()
-	m.mu.Lock()
-	s, ok := m.sessions[sid]
-	m.mu.Unlock()
-	if !ok {
-		return engine.Response{}, fmt.Errorf("未知会话 %s", sid)
-	}
-	return s.dispatch(ev), nil
-}
-
-// Flush 将引擎的用户词频增量合并落盘（原子写）。无变更时为空操作。
+// Flush 将引擎的用户词频增量合并进用户词库并原子落盘；无变更时为空操作。
+// 写失败时增量留在内存，下次调用重试，不会丢失。
 func (m *Manager) Flush() error {
+	delta := m.eng.DrainUserDelta()
 	if m.userPath == "" {
 		return nil
 	}
-	delta := m.eng.DrainUserDelta()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(delta) == 0 {
+	m.flushMu.Lock()
+	defer m.flushMu.Unlock()
+	m.pending = append(m.pending, delta...)
+	if len(m.pending) == 0 {
 		return nil
 	}
 	entries, err := LoadUserEntries(m.userPath)
+	if err == nil {
+		err = SaveUserEntries(m.userPath, mergeEntries(entries, m.pending))
+	}
 	if err != nil {
+		// 合并同词条，保证持续写失败时内存占用不随按键线性增长。
+		m.pending = mergeEntries(nil, m.pending)
 		return err
 	}
-	merged := mergeEntries(entries, delta)
-	return SaveUserEntries(m.userPath, merged)
+	m.pending = nil
+	return nil
 }
 
-// Close 结束所有会话并落盘用户词频。
-func (m *Manager) Close() error {
-	m.mu.Lock()
-	sessions := m.sessions
-	m.sessions = make(map[string]*session)
-	m.mu.Unlock()
-	for _, s := range sessions {
-		s.dispatch(engine.Event{FocusOut: true})
-		s.s.Close()
+// Client 是单条 shim 连接内的会话表。非并发安全，由连接读循环串行调用。
+type Client struct {
+	m        *Manager
+	sessions map[string]*engine.Session
+}
+
+// FocusIn 为新文档创建会话并返回初始状态；同 sid 重复进入时以新文档为准重建。
+// 新会话继承当前共享模式。
+func (c *Client) FocusIn(sid, app string) engine.Response {
+	c.m.touch()
+	if old, ok := c.sessions[sid]; ok {
+		old.Close()
+	} else {
+		c.m.active.Add(1)
 	}
-	return m.Flush()
+	s := c.m.eng.NewSession(engine.SessionMeta{App: app})
+	c.sessions[sid] = s
+	mode := c.m.Mode()
+	return s.Handle(engine.Event{Toggle: &mode})
 }
 
-func (s *session) dispatch(ev engine.Event) engine.Response {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.s.Handle(ev)
+// FocusOut 结束会话并返回引擎的收尾响应（失焦上屏策略产生的 commit）。
+func (c *Client) FocusOut(sid string) (engine.Response, error) {
+	s, ok := c.remove(sid)
+	if !ok {
+		return engine.Response{}, ErrUnknownSession
+	}
+	resp := s.Handle(engine.Event{FocusOut: true})
+	s.Close()
+	return resp, nil
 }
 
-// mergeEntries 把增量按（词, 拼音）合并进既有条目，返回按词频降序的新列表。
+// End 静默结束会话（shim 的 bye），不产生响应；会话不存在时为空操作。
+func (c *Client) End(sid string) {
+	if s, ok := c.remove(sid); ok {
+		s.Close()
+	}
+}
+
+// Handle 把事件路由到会话，并把响应中的模式记为共享模式。
+func (c *Client) Handle(sid string, ev engine.Event) (engine.Response, error) {
+	c.m.touch()
+	s, ok := c.sessions[sid]
+	if !ok {
+		return engine.Response{}, ErrUnknownSession
+	}
+	resp := s.Handle(ev)
+	c.m.setMode(resp.Mode)
+	return resp, nil
+}
+
+// Len 返回本连接的活动会话数。
+func (c *Client) Len() int {
+	return len(c.sessions)
+}
+
+// Close 结束本连接的全部会话。连接已断，收尾响应无处投递，直接丢弃。
+func (c *Client) Close() {
+	for sid := range c.sessions {
+		c.End(sid)
+	}
+}
+
+func (c *Client) remove(sid string) (*engine.Session, bool) {
+	s, ok := c.sessions[sid]
+	if ok {
+		delete(c.sessions, sid)
+		c.m.active.Add(-1)
+	}
+	return s, ok
+}
+
+// mergeEntries 把增量按（词, 拼音）合并进既有条目，返回合并后的列表。
 func mergeEntries(entries []engine.UserEntry, delta []engine.UserEntry) []engine.UserEntry {
 	index := make(map[[2]string]int, len(entries))
 	for i, e := range entries {

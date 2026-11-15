@@ -18,6 +18,14 @@
 - 错误必须处理或返回。补充错误上下文时使用 `%w` 包装，需要判断错误类型时使用 `errors.Is` 或 `errors.As`；可预期错误不得通过 `panic` 处理。
 - 先保证正确性和可读性，再依据测量优化性能；热路径避免不必要的分配、复制和重复计算。
 
+### 日志
+
+- host 与 TIP 运行日志使用结构化 logfmt（一行一条 `key=value`）；消息使用简洁中文，字段名保持稳定，变量放字段，不拼接到消息中。安装器沿用 Inno Setup 原生日志，记录操作与失败原因。
+- `info` 记录生命周期与关键状态，`warn` 记录可恢复异常和降级，`error` 记录操作失败，`debug` 仅用于排障细节；错误附带操作、错误码或 `err` 及必要的连接、请求上下文。
+- 输入、候选、上屏原文及可还原输入的键码序列均属敏感数据；默认只记录必要计数。原文仅通过统一入口在显式设置 `SILK_LOG_TEXT=1` 时用于本机排障，开启时明确警告；`debug` 不解除脱敏，错误与 panic 也不能直接输出任意载荷。
+- TSF 按键回调不得因日志执行文件 I/O、等待日志锁或格式化用户内容；只累计数值，由现有 IPC 后台线程汇总。重复故障限频，后台日志不得阻塞当前请求的应答通知。
+- 多进程日志独立写入，限制单文件与目录总量；清理只能操作本组件拥有的日志，失败时宁可丢日志，不影响输入。不为统一格式引入全字段白名单框架或要求正式版本失去诊断能力。
+
 ### 测试
 
 - 测试关注可观察行为、边界条件、错误路径与缺陷回归，不绑定实现细节。
@@ -25,8 +33,12 @@
 
 ## 提交约定
 
-- 提交信息与 PR 标题采用 Conventional Commits：`类型: 中文主题`，类型限定 `feat`/`fix`/`docs`/`refactor`/`perf`/`test`/`chore`，可选 scope；squash 合并下 PR 标题即主干提交信息，release-please 据此维护 CHANGELOG 与版本发布。
+- 提交信息与 PR 标题采用 Conventional Commits：`类型: 中文主题`，类型限定 `feat`/`fix`/`docs`/`refactor`/`perf`/`test`/`chore`，可选 scope；squash 合并下 PR 标题即主干提交信息。
 - 主题表达意图而非改动清单；破坏性变更在正文以 `BREAKING CHANGE: ` 标注。
+
+## 发布
+
+- 版本发布由 release-please 自动化：依据 Conventional Commits 生成 CHANGELOG 与版本号并维护 release PR；`CHANGELOG.md` 与 `.release-please-manifest.json` 中的版本号只由它更新，手动勿改。
 
 ## 操作规范
 

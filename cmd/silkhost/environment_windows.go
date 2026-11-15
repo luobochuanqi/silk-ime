@@ -9,6 +9,8 @@ import (
 	"runtime"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/luobochuanqi/silk-ime/internal/logging"
 )
 
 func logStartup(dataDir string) {
@@ -21,7 +23,7 @@ func logStartup(dataDir string) {
 	slog.LogAttrs(ctx, slog.LevelInfo, "silkhost 启动",
 		slog.String("version", buildVersion()),
 		slog.Int("pid", os.Getpid()),
-		slog.String("data", dataDir),
+		logging.Text("data", dataDir),
 		slog.String("windows_version", fmt.Sprintf("%d.%d", version.MajorVersion, version.MinorVersion)),
 		slog.Uint64("windows_build", uint64(version.BuildNumber)),
 		slog.String("process_arch", runtime.GOARCH),
@@ -35,7 +37,7 @@ func nativeArchitecture() slog.Attr {
 	var processMachine, nativeMachine uint16
 	// GOARCH 只代表当前进程；在 ARM64 模拟运行时必须向系统查询本机架构。
 	if err := windows.IsWow64Process2(windows.CurrentProcess(), &processMachine, &nativeMachine); err != nil {
-		return slog.Any("native_arch_err", err)
+		return logging.Sensitive("native_arch_err", err)
 	}
 	switch nativeMachine {
 	case pe.IMAGE_FILE_MACHINE_I386:

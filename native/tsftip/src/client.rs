@@ -30,12 +30,12 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
     FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::WaitNamedPipeW;
 use windows::Win32::System::Threading::{
     CreateEventW, CreateProcessW, ResetEvent, WaitForSingleObject, CREATE_NO_WINDOW,
     PROCESS_INFORMATION, STARTUPINFOW,
 };
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use crate::key::Mode;
 use crate::msg::{self, Incoming};
@@ -71,17 +71,6 @@ pub enum Reply {
     Timeout,
     /// 管道不可用（未连接或写失败）。
     Disconnected,
-}
-
-impl Reply {
-    /// 日志用的结果类别。
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Reply::Messages(_) => "messages",
-            Reply::Timeout => "timeout",
-            Reply::Disconnected => "disconnected",
-        }
-    }
 }
 
 /// 当前焦点会话，供连接（重）建立时补发 `focus_in`。
@@ -273,7 +262,6 @@ pub struct Client {
     tx: Sender<Command>,
     shared: Arc<Shared>,
     link: Arc<Link>,
-    next_id: AtomicU64,
 }
 
 impl Client {
@@ -294,12 +282,7 @@ impl Client {
         let _ = std::thread::Builder::new()
             .name("silk-ipc-connect".to_owned())
             .spawn(move || connector_loop(connector_link, connector_shared));
-        Client {
-            tx,
-            shared,
-            link,
-            next_id: AtomicU64::new(0),
-        }
+        Client { tx, shared, link }
     }
 
     pub fn shared(&self) -> Arc<Shared> {
@@ -310,7 +293,9 @@ impl Client {
     /// 绝不等待建连。
     pub fn request(&self, env: &Envelope, timeout: Duration) -> Reply {
         let mut env = env.clone();
-        env.id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        // 多个 TIP 实例共用序号，pid/id 可唯一关联 host 日志，不依赖本地连接编号。
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        env.id = NEXT_ID.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = mpsc::channel();
         let cmd = Command {
             env,
@@ -360,25 +345,34 @@ fn worker_loop(rx: Receiver<Command>, shared: Arc<Shared>, link: Arc<Link>) {
                 if pipe.as_ref().is_some_and(Pipe::closed)
                     || keepalive(&mut pipe, &mut last_tx).is_err()
                 {
-                    drop_pipe(&mut pipe, &shared, &link, "空闲探测失败");
+                    drop_pipe(&mut pipe, &shared, &link);
                 }
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => return,
         };
+        let started = Instant::now();
         // 调用方已超时放行的请求不得再送 host：否则 host 会对已直通给应用的字母
         // 继续组字，下一键冒出一串「幽灵」preedit。
         if cmd.deadline.is_some_and(|at| Instant::now() >= at) {
-            log::debug!(id = cmd.env.id, kind = cmd.env.type_.as_str(); "丢弃过期请求");
+            crate::logger::count(crate::logger::Event::Expired);
+            // 请求已失效，先释放应答发送端，再发布仅含数值的抽样。
+            drop(cmd.reply);
+            crate::logger::sample_request(crate::logger::RequestSample {
+                id: cmd.env.id,
+                elapsed_us: started.elapsed().as_micros() as u64,
+                result: 3,
+                frames: 0,
+            });
             continue;
         }
         let mut fresh = false;
         if pipe.is_none() {
             link.request();
             // 只在调用方剩余预算内等后台交出连接：IO 线程被建连拖住会让排队请求全部过期。
-            let wait = cmd
-                .deadline
-                .map_or(Duration::ZERO, |at| at.saturating_duration_since(Instant::now()));
+            let wait = cmd.deadline.map_or(Duration::ZERO, |at| {
+                at.saturating_duration_since(Instant::now())
+            });
             pipe = link.wait_ready(wait);
             fresh = pipe.is_some();
         }
@@ -386,6 +380,12 @@ fn worker_loop(rx: Receiver<Command>, shared: Arc<Shared>, link: Arc<Link>) {
             // 未连上：当场 fail-open（04 降级矩阵），后台按限速继续重试。
             if let Some(reply) = &cmd.reply {
                 let _ = reply.send(Reply::Disconnected);
+                crate::logger::sample_request(crate::logger::RequestSample {
+                    id: cmd.env.id,
+                    elapsed_us: started.elapsed().as_micros() as u64,
+                    result: 2,
+                    frames: 0,
+                });
             }
             continue;
         };
@@ -404,48 +404,60 @@ fn worker_loop(rx: Receiver<Command>, shared: Arc<Shared>, link: Arc<Link>) {
             None => post_only(&mut conn, &cmd.env),
         };
         if matches!(reply, Reply::Disconnected) {
-            drop_pipe(&mut pipe, &shared, &link, "读写失败");
+            drop_pipe(&mut pipe, &shared, &link);
         } else {
             pipe = Some(conn);
         }
         if let Some(tx) = cmd.reply {
+            let (result, frames) = match &reply {
+                Reply::Messages(messages) => (
+                    if matches!(messages.last(), Some(Incoming::Error { .. })) {
+                        4
+                    } else {
+                        0
+                    },
+                    messages.len(),
+                ),
+                Reply::Timeout => (1, 0),
+                Reply::Disconnected => (2, 0),
+            };
+            let sample = crate::logger::RequestSample {
+                id: cmd.env.id,
+                elapsed_us: started.elapsed().as_micros() as u64,
+                result,
+                frames,
+            };
             let _ = tx.send(reply);
+            crate::logger::sample_request(sample);
         }
     }
 }
 
 /// 连接因读写失败或对端关闭而不可用：丢弃并让后台线程重连。
-fn drop_pipe(pipe: &mut Option<Pipe>, shared: &Shared, link: &Link, reason: &str) {
+fn drop_pipe(pipe: &mut Option<Pipe>, shared: &Shared, link: &Link) {
     *pipe = None;
     shared.connected.store(false, Ordering::Relaxed);
-    let failures = shared.failures.fetch_add(1, Ordering::Relaxed) + 1;
-    log::warn!(reason, failures; "连接断开，后台重连");
+    shared.failures.fetch_add(1, Ordering::Relaxed);
+    crate::logger::count(crate::logger::Event::Disconnect);
     link.request();
 }
 
 /// 一次请求-应答：写一帧，收齐 id 匹配的应答。
 fn exchange(pipe: &mut Pipe, env: &Envelope, deadline: Instant, shared: &Shared) -> Reply {
-    let started = Instant::now();
     let Ok(frame) = encode(env) else {
-        log::error!(kind = env.type_.as_str(); "请求编码失败");
+        crate::logger::count(crate::logger::Event::BadFrame);
         return Reply::Disconnected;
     };
     if pipe.write(&frame).is_err() {
         return Reply::Disconnected;
     }
-    let elapsed_us = || started.elapsed().as_micros() as u64;
     match read_response(env.id, deadline, |wait| pipe.recv(wait), shared) {
         Ok(messages) if messages.is_empty() => {
-            let failures = shared.failures.fetch_add(1, Ordering::Relaxed) + 1;
-            log::warn!(id = env.id, kind = env.type_.as_str(), waited_us = elapsed_us(), failures;
-                "host 应答超时，按键放行");
+            shared.failures.fetch_add(1, Ordering::Relaxed);
+            crate::logger::count(crate::logger::Event::Timeout);
             Reply::Timeout
         }
-        Ok(messages) => {
-            log::debug!(id = env.id, kind = env.type_.as_str(), rtt_us = elapsed_us(), frames = messages.len();
-                "应答");
-            Reply::Messages(messages)
-        }
+        Ok(messages) => Reply::Messages(messages),
         Err(()) => Reply::Disconnected,
     }
 }
@@ -486,17 +498,17 @@ fn read_response(
         };
         // 畸形帧说明流已错位（04：必须断开），交给外层重连。
         let Ok(env) = decode(&body) else {
-            log::warn!("下行帧畸形，断开连接");
+            crate::logger::count(crate::logger::Event::BadFrame);
             return Err(());
         };
         if env.id != id {
-            log::debug!(id = env.id, kind = env.type_.as_str(), want = id; "丢弃非本请求的下行帧");
+            crate::logger::count(crate::logger::Event::Stale);
             continue;
         }
         let incoming = msg::parse_incoming(&env);
         observe(&incoming, shared);
-        if let Incoming::Error { code, msg } = &incoming {
-            log::warn!(id, code = *code; "host 拒绝请求: {msg}");
+        if matches!(incoming, Incoming::Error { .. }) {
+            crate::logger::count(crate::logger::Event::HostError);
         }
         let last = matches!(
             incoming,
@@ -533,26 +545,25 @@ fn connector_loop(link: Arc<Link>, shared: Arc<Shared>) {
     let mut spawns: Vec<Instant> = Vec::new();
     let mut retry_at = Instant::now();
     loop {
+        // 仅连接线程落盘，不在请求 worker 收帧或通知 TSF 应答之前写日志。
+        // 不持有 Link 的锁：日志慢盘不能阻塞按键线程发出建连请求。
+        crate::logger::summarize();
         {
             let mut state = link.state();
-            loop {
-                if state.stopping {
-                    return;
-                }
-                if state.wanted && Instant::now() >= retry_at {
-                    break;
-                }
+            if state.stopping {
+                return;
+            }
+            if !state.wanted || Instant::now() < retry_at {
                 let wait = if state.wanted {
                     retry_at.saturating_duration_since(Instant::now())
                 } else {
-                    // 无请求时久等：唤醒只来自 request/stop。
                     Duration::from_secs(5)
                 };
-                let (next, _) = link
+                let _ = link
                     .wake
                     .wait_timeout(state, wait)
                     .unwrap_or_else(|e| e.into_inner());
-                state = next;
+                continue;
             }
             state.wanted = false;
         }
@@ -566,9 +577,8 @@ fn connector_loop(link: Arc<Link>, shared: Arc<Shared>) {
 
 /// 建一条连接：先连已在跑的 host，没有就限速拉起再连。全程只在本线程上。
 fn open_link(shared: &Shared, spawns: &mut Vec<Instant>) -> Option<Pipe> {
-    let started = Instant::now();
     let Some(sid) = util::current_user_sid() else {
-        log::error!("取当前用户 SID 失败，无法定位管道");
+        crate::logger::count(crate::logger::Event::ConnectError);
         return None;
     };
     let name = format!(r"\\.\pipe\silk-ime-{sid}");
@@ -578,7 +588,6 @@ fn open_link(shared: &Shared, spawns: &mut Vec<Instant>) -> Option<Pipe> {
             // 无人监听：按注册表安装目录拉起 host，限速 3 次/分钟。
             spawns.retain(|t| t.elapsed() < SPAWN_WINDOW);
             if spawns.len() >= SPAWN_BUDGET {
-                log::debug!(budget = SPAWN_BUDGET; "host 拉起次数超限，暂停拉起");
                 return None;
             }
             if !spawn_host() {
@@ -591,7 +600,7 @@ fn open_link(shared: &Shared, spawns: &mut Vec<Instant>) -> Option<Pipe> {
                     break pipe;
                 }
                 if Instant::now() >= deadline {
-                    log::warn!(waited_ms = SPAWN_WAIT.as_millis() as u64; "host 已拉起但管道未就绪");
+                    crate::logger::count(crate::logger::Event::ConnectError);
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -599,10 +608,10 @@ fn open_link(shared: &Shared, spawns: &mut Vec<Instant>) -> Option<Pipe> {
         }
     };
     if !handshake(&mut pipe, shared) {
-        log::warn!("握手失败");
+        crate::logger::count(crate::logger::Event::ConnectError);
         return None;
     }
-    log::info!(elapsed_ms = started.elapsed().as_millis() as u64; "已连接 host");
+    crate::logger::count(crate::logger::Event::Connected);
     Some(pipe)
 }
 
@@ -628,15 +637,17 @@ fn handshake(pipe: &mut Pipe, shared: &Shared) -> bool {
         };
         match msg::parse_incoming(&env) {
             Incoming::Welcome(cfg) => {
-                shared.page_size.store(cfg.page_size.max(1), Ordering::Relaxed);
+                shared
+                    .page_size
+                    .store(cfg.page_size.max(1), Ordering::Relaxed);
                 shared.set_mode(cfg.chinese, cfg.full_punct);
                 shared.connected.store(true, Ordering::Relaxed);
                 shared.failures.store(0, Ordering::Relaxed);
                 return true;
             }
             // welcome 之前的别的消息只可能是 error：版本不匹配即放弃连接。
-            Incoming::Error { code, msg } => {
-                log::warn!(code; "host 拒绝握手: {msg}");
+            Incoming::Error { .. } => {
+                crate::logger::count(crate::logger::Event::HostError);
                 return false;
             }
             _ => {}
@@ -648,7 +659,9 @@ fn handshake(pipe: &mut Pipe, shared: &Shared) -> bool {
 fn observe(incoming: &Incoming, shared: &Shared) {
     match incoming {
         Incoming::Welcome(cfg) => {
-            shared.page_size.store(cfg.page_size.max(1), Ordering::Relaxed);
+            shared
+                .page_size
+                .store(cfg.page_size.max(1), Ordering::Relaxed);
             shared.set_mode(cfg.chinese, cfg.full_punct);
         }
         Incoming::Update(update) => {
@@ -663,12 +676,12 @@ fn observe(incoming: &Incoming, shared: &Shared) {
 /// 按注册表安装目录拉起 host；失败不改状态（调用方本就在降级路径上）。
 fn spawn_host() -> bool {
     let Some(dir) = util::read_install_path().or_else(util::module_dir) else {
-        log::error!("找不到安装目录（注册表 InstallPath 与模块路径均不可用）");
+        crate::logger::count(crate::logger::Event::ConnectError);
         return false;
     };
     let exe = dir.join("silkhost.exe");
     if !exe.is_file() {
-        log::error!(exe = exe.display().to_string().as_str(); "host 可执行文件不存在");
+        crate::logger::count(crate::logger::Event::ConnectError);
         return false;
     }
     let dict = dir.join("dict").join("silk.dict");
@@ -698,11 +711,11 @@ fn spawn_host() -> bool {
             &mut info,
         )
     };
-    if let Err(err) = ok {
-        log::error!(exe = exe.display().to_string().as_str(); "拉起 host 失败: {err}");
+    if ok.is_err() {
+        crate::logger::count(crate::logger::Event::ConnectError);
         return false;
     }
-    log::info!(pid = info.dwProcessId, exe = exe.display().to_string().as_str(); "已拉起 host");
+    crate::logger::count(crate::logger::Event::Spawned);
     // SAFETY: 两个句柄刚由 CreateProcessW 填写、尚未转交别人；本进程不需要它们，
     // 关掉即释放引用（host 进程本身继续运行）。
     unsafe {
@@ -964,7 +977,9 @@ impl Pipe {
 
     /// 读线程已退出（对端关闭或流错位）：连接不可再用。
     fn closed(&self) -> bool {
-        self.reader.as_ref().map_or(true, |reader| reader.is_finished())
+        self.reader
+            .as_ref()
+            .map_or(true, |reader| reader.is_finished())
     }
 }
 
@@ -1011,7 +1026,8 @@ fn read_loop(handle: HANDLE, tx: Sender<Vec<u8>>, stopping: Arc<AtomicBool>) {
             if pending.len() < 4 {
                 break;
             }
-            let size = u32::from_le_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
+            let size =
+                u32::from_le_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
             if size > silk_protocol::MAX_FRAME_SIZE || pending.len() < 4 + size {
                 // 超限即流错位（04：必须断开）；帧不完整则等下一次读。
                 if size > silk_protocol::MAX_FRAME_SIZE {
@@ -1067,7 +1083,10 @@ mod tests {
         let reply = client.request(&crate::msg::hello(), Duration::from_millis(15));
         // 本机没有 host 时是 Timeout/Disconnected；有 host 时 30 ms 内连上属正常。
         assert!(!matches!(reply, Reply::Messages(ref m) if m.is_empty()));
-        assert!(started.elapsed() < Duration::from_secs(2), "30 ms 预算未守住");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "30 ms 预算未守住"
+        );
     }
 
     #[test]
@@ -1158,8 +1177,8 @@ mod tests {
 
     #[test]
     fn commit_then_update_is_one_response() {
-        let messages = response_from(vec![commit_env(ID, "好"), update_env(ID, "")])
-            .expect("应收到响应");
+        let messages =
+            response_from(vec![commit_env(ID, "好"), update_env(ID, "")]).expect("应收到响应");
         assert_eq!(messages.len(), 2, "commit 与收尾 update 都必须到达");
         assert_eq!(messages[0], Incoming::Commit("好".to_owned()));
         assert!(matches!(messages[1], Incoming::Update(_)));
@@ -1184,7 +1203,9 @@ mod tests {
         // 收到 commit 后超时：已到的上屏不能丢。
         let messages = response_from(vec![commit_env(ID, "好")]).expect("超时不算断连");
         assert_eq!(messages, vec![Incoming::Commit("好".to_owned())]);
-        assert!(response_from(Vec::new()).expect("空响应不算断连").is_empty());
+        assert!(response_from(Vec::new())
+            .expect("空响应不算断连")
+            .is_empty());
     }
 }
 
@@ -1214,7 +1235,14 @@ mod smoke {
                     "welcome 应先到"
                 );
             }
-            other => panic!("握手失败，收到 {} 类回复", match other { Reply::Timeout => "timeout", Reply::Disconnected => "disconnected", _ => "unknown" }),
+            other => panic!(
+                "握手失败，收到 {} 类回复",
+                match other {
+                    Reply::Timeout => "timeout",
+                    Reply::Disconnected => "disconnected",
+                    _ => "unknown",
+                }
+            ),
         }
         assert!(shared.is_connected());
         assert!(shared.page_size() >= 1);
@@ -1242,7 +1270,14 @@ mod smoke {
                 assert_eq!(update.preedit, "h");
                 assert!(!update.candidates.is_empty(), "h 应有候选");
             }
-            other => panic!("按键失败，收到 {} 类回复", match other { Reply::Timeout => "timeout", Reply::Disconnected => "disconnected", _ => "unknown" }),
+            other => panic!(
+                "按键失败，收到 {} 类回复",
+                match other {
+                    Reply::Timeout => "timeout",
+                    Reply::Disconnected => "disconnected",
+                    _ => "unknown",
+                }
+            ),
         }
 
         client.post(&msg::focus_out(0, sid));

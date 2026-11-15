@@ -31,7 +31,7 @@ const maintenanceInterval = 30 * time.Second
 
 func main() {
 	if err := run(); err != nil {
-		slog.Error("silkhost 异常退出", "err", err)
+		slog.Error("silkhost 异常退出", logging.Sensitive("err", err))
 		os.Exit(1)
 	}
 }
@@ -62,13 +62,13 @@ func run() error {
 		Console:  stderrAttached(),
 	})
 	if err != nil {
-		slog.Warn("日志文件不可用，仅输出到 stderr", "err", err)
+		slog.Warn("日志文件不可用，仅输出到 stderr", logging.Sensitive("err", err))
 	} else {
 		defer logFile.Close()
 	}
 	logStartup(paths.Dir)
 	if cfgErr != nil {
-		slog.Error("配置无效，使用默认配置", "path", paths.Config, "err", cfgErr)
+		slog.Error("配置无效，使用默认配置", logging.Text("path", paths.Config), logging.Sensitive("err", cfgErr))
 	}
 	declareDPIAwareness()
 
@@ -79,7 +79,7 @@ func run() error {
 	userEntries, err := session.LoadUserEntries(paths.UserDict)
 	if err != nil {
 		// 落盘时会再次读取并失败，增量留在内存，不会覆盖读不出来的用户词库。
-		slog.Error("用户词库不可读，本次不加载", "path", paths.UserDict, "err", err)
+		slog.Error("用户词库不可读，本次不加载", logging.Text("path", paths.UserDict), logging.Sensitive("err", err))
 	}
 	eng, err := engine.Open(dictData, userEntries, engine.Config{
 		PageSize:          cfg.PageSize,
@@ -89,12 +89,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("打开引擎: %w", err)
 	}
-	slog.Info("引擎就绪", "dict", *dictPath, "user_entries", len(userEntries), "page_size", cfg.PageSize)
+	slog.Info("引擎就绪", logging.Text("dict", *dictPath), "user_entries", len(userEntries), "page_size", cfg.PageSize)
 	mgr := session.NewManager(eng, paths.UserDict)
 
 	cw, err := loadCandidateWindow()
 	if err != nil {
-		slog.Warn("候选窗不可用，以无窗模式运行", "err", err)
+		slog.Warn("候选窗不可用，以无窗模式运行", logging.Sensitive("err", err))
 	}
 	ui := &presenter{w: cw}
 
@@ -161,7 +161,7 @@ func listen(name string) (net.Listener, error) {
 		}
 		return nil, fmt.Errorf("监听管道 %s: %w", name, err)
 	}
-	slog.Info("管道就绪", "pipe", name)
+	slog.Info("管道就绪", logging.Identifier("pipe", name))
 	return ln, nil
 }
 
@@ -172,7 +172,7 @@ func serve(ln net.Listener, mgr *session.Manager, ui *presenter, pageSize int) {
 		nc, err := ln.Accept()
 		if err != nil {
 			if !errors.Is(err, winio.ErrPipeListenerClosed) {
-				slog.Error("接受连接失败，停止服务", "err", err)
+				slog.Error("接受连接失败，停止服务", logging.Sensitive("err", err))
 			}
 			return
 		}
@@ -182,7 +182,7 @@ func serve(ln net.Listener, mgr *session.Manager, ui *presenter, pageSize int) {
 
 func flush(mgr *session.Manager) {
 	if err := mgr.Flush(); err != nil {
-		slog.Error("用户词库落盘失败，增量保留待重试", "err", err)
+		slog.Error("用户词库落盘失败，增量保留待重试", logging.Sensitive("err", err))
 	}
 }
 

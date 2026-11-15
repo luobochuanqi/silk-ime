@@ -50,7 +50,7 @@ SilkUnregister(scope)  // 与注册对称清理（含用户语言列表序号重
 SilkRegisterSelf()     // = SilkRegister(user)，供安装器提升后以原用户身份补登记
 ```
 
-注册结果写执行账户的 `%LOCALAPPDATA%\Silk\logs\tsftip.log`。以上三个导出是专用 rundll32 入口，均采用四参数回调 ABI，并主动结束该 rundll32 进程：成功退出码 0，失败 1；禁止从 COM 宿主内直接调用。DLL 不自行弹窗，安装器统一处理交互和静默失败。安装器流程：提升注册机器级 → 以**原始用户身份**跑 `SilkRegisterSelf`（竞品踩过的坑：提升上下文注册到了管理员账户）。
+注册结果写执行账户的 `%LOCALAPPDATA%\Silk\logs\tsftip-<PID>-<启动标识>.log`。以上三个导出是专用 rundll32 入口，均采用四参数回调 ABI，并主动结束该 rundll32 进程：成功退出码 0，失败 1；禁止从 COM 宿主内直接调用。DLL 不自行弹窗，安装器统一处理交互和静默失败。安装器流程：提升注册机器级 → 以**原始用户身份**跑 `SilkRegisterSelf`（竞品踩过的坑：提升上下文注册到了管理员账户）。
 
 ### 激活感知
 

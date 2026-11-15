@@ -366,7 +366,7 @@ fn unregister_result(
             if absent() {
                 return true;
             }
-            log::error!(action, error = error.to_string().as_str(); "注销接口调用失败");
+            log::error!(action, error = error.code().0; "注销接口调用失败");
             false
         }
     }

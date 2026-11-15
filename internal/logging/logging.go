@@ -5,12 +5,18 @@
 package logging
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"strings"
 	"sync/atomic"
+	"syscall"
+	"time"
 	"unicode/utf8"
 )
 
@@ -36,27 +42,35 @@ type Options struct {
 	Console bool
 }
 
-// Setup 按 opts 创建日志器并设为 slog 默认值。返回的 io.Closer 负责关闭日志文件，
-// 调用方应在进程退出前调用。日志文件不可用时返回错误，此时调用方可继续以 stderr 运行。
+// Setup 创建日志器并设为 slog 默认值；返回的 io.Closer 由调用方在退出时关闭。
+// 文件或级别配置不可用时仍安装 stderr 日志器并返回错误，保证隐私策略与告警生效。
 func Setup(opts Options) (*slog.Logger, io.Closer, error) {
+	logText.Store(os.Getenv(EnvText) == "1")
 	level, err := ParseLevel(firstNonEmpty(os.Getenv(EnvLevel), opts.Level))
 	if err != nil {
-		return nil, nil, err
+		level = slog.LevelInfo
 	}
-	logText.Store(os.Getenv(EnvText) == "1")
-
-	file, err := openRotating(opts.Path, opts.MaxBytes, opts.Backups)
-	if err != nil {
-		return nil, nil, err
-	}
-	var w io.Writer = file
-	if opts.Console {
-		// 文件在前：stderr 无效（无控制台）时 MultiWriter 在其后失败，不影响落盘。
-		w = io.MultiWriter(file, os.Stderr)
+	var closer io.Closer
+	var w io.Writer = os.Stderr
+	if err == nil {
+		file, openErr := openRotating(opts.Path, opts.MaxBytes, opts.Backups)
+		err = openErr
+		if err == nil {
+			closer, w = file, file
+			if opts.Console {
+				// 文件在前：stderr 无效时不影响落盘。
+				w = io.MultiWriter(file, os.Stderr)
+			}
+		}
 	}
 	logger := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level, ReplaceAttr: localTime}))
 	slog.SetDefault(logger)
-	return logger, file, nil
+	if logText.Load() {
+		// 直接交给 handler：即使仅记录 error，也不能过滤掉隐私风险告警。
+		_ = logger.Handler().Handle(context.Background(), slog.NewRecord(time.Now(), slog.LevelWarn,
+			"SILK_LOG_TEXT=1：日志将包含用户输入及敏感内容，仅限临时本机排障", 0))
+	}
+	return logger, closer, err
 }
 
 // localTime 把时间格式化为本地毫秒精度、不带时区，与 tsftip 日志一致，两份日志可按时间直接对齐。
@@ -88,6 +102,38 @@ func Text(key, s string) slog.Attr {
 		return slog.String(key, s)
 	}
 	return slog.Int(key+"_len", utf8.RuneCountInString(s))
+}
+
+// Identifier 默认只保留摘要，便于关联不可信的会话标识而不记录原文。
+func Identifier(key, s string) slog.Attr {
+	if logText.Load() {
+		return Text(key, s)
+	}
+	sum := sha256.Sum256([]byte(s))
+	return slog.String(key+"_sha256", fmt.Sprintf("%x", sum[:16]))
+}
+
+// Sensitive 处理可能把输入嵌入 Error/String 方法的任意值；默认不调用这些方法。
+func Sensitive(key string, value any) slog.Attr {
+	if logText.Load() {
+		return Text(key, fmt.Sprint(value))
+	}
+	typ := slog.String(key+"_type", fmt.Sprintf("%T", value))
+	if err, ok := value.(error); ok {
+		// 仅提取类型化数值，绝不调用 Error/String 或记录错误携带的路径、字段、原文。
+		var errno syscall.Errno
+		var syntax *json.SyntaxError
+		var mismatch *json.UnmarshalTypeError
+		switch {
+		case errors.As(err, &errno):
+			return slog.Group("", typ, slog.Uint64(key+"_errno", uint64(errno)))
+		case errors.As(err, &syntax) && syntax != nil:
+			return slog.Group("", typ, slog.String(key+"_kind", "json_syntax"), slog.Int64(key+"_offset", syntax.Offset))
+		case errors.As(err, &mismatch) && mismatch != nil:
+			return slog.Group("", typ, slog.String(key+"_kind", "json_type"), slog.Int64(key+"_offset", mismatch.Offset))
+		}
+	}
+	return typ
 }
 
 func firstNonEmpty(values ...string) string {

@@ -101,7 +101,7 @@ sequenceDiagram
 - v1 手动更新：检查更新入口显式、默认不自动下载不自动安装（“默认值即产品立场”）。
 - 无人值守安装使用 `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="安装日志路径"`；必须检查退出码，注册失败返回 1。不要额外指定 `/RESTARTEXITCODE`：Inno Setup 在需要重启时会优先采用该值，跳过自定义注册失败码。退出码 0 也不代表无需重启，需检查日志中的重启状态；`/NORESTART` 只禁止自动重启。
 - 无人值守卸载使用 `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="卸载日志路径"`。卸载器不支持安装器的 `/RESTARTEXITCODE`，不可用退出码 0 推断没有待重启删除。
-- 安装日志默认开启；反馈卸载问题时用 `/LOG` 显式保存日志，并与执行账户 `%LOCALAPPDATA%\Silk\logs\tsftip.log` 对照。路径可能含账户信息，公开前应脱敏。
+- 安装日志默认开启；反馈卸载问题时用 `/LOG` 显式保存日志，并与执行账户 `%LOCALAPPDATA%\Silk\logs\tsftip-<PID>-<启动标识>.log` 对照，选择故障时刻的 rundll32 进程日志。路径可能含账户信息，公开前应脱敏。
 
 ## 需求映射
 

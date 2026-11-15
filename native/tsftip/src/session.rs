@@ -8,9 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use silk_protocol::Envelope;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfContext, ITfDocumentMgr, ITfThreadMgr,
-};
+use windows::Win32::UI::TextServices::{ITfComposition, ITfContext, ITfDocumentMgr, ITfThreadMgr};
 
 use crate::client::{Client, Reply, Shared};
 use crate::key::{should_consume, Decision, Mode};
@@ -177,6 +175,8 @@ impl Session {
         mods: u8,
         ts: u64,
     ) -> KeyOutcome {
+        let _hot = crate::logger::hot_path();
+        crate::logger::count(crate::logger::Event::Key);
         let had = { self.lock().composing() };
         let sid = { self.lock().sid.clone() };
         // 没有焦点会话：放行，按键由应用自己处理。
@@ -187,7 +187,7 @@ impl Session {
         let reply = self.request(&env);
         let plan = plan_from_reply(&reply, had, code);
         if plan.passthrough {
-            log::debug!(sid = sid.as_str(), code, reply = reply.kind(); "按键放行");
+            crate::logger::count(crate::logger::Event::Pass);
             return KeyOutcome { eaten: false };
         }
         let intents = self.absorb(&plan.messages);
@@ -197,12 +197,12 @@ impl Session {
                 return KeyOutcome { eaten: false };
             }
         }
-        log::debug!(sid = sid.as_str(), code, eaten = plan.eaten, intents = intents.len(); "按键");
         KeyOutcome { eaten: plan.eaten }
     }
 
     /// 选择/翻页/取消等动作不进入按键通道，同样带硬超时。
     pub fn handle_action(self: &Arc<Self>, env: &Envelope) -> bool {
+        let _hot = crate::logger::hot_path();
         match self.request(env) {
             Reply::Messages(messages) => {
                 let intents = self.absorb(&messages);
@@ -221,8 +221,8 @@ impl Session {
         }
         match crate::edit::apply(self, intent) {
             Ok(()) => true,
-            Err(err) => {
-                log::warn!(intent = intent.describe().as_str(); "编辑会话失败: {err}");
+            Err(_) => {
+                crate::logger::count(crate::logger::Event::EditError);
                 self.lock().candidates.clear();
                 false
             }
@@ -276,20 +276,6 @@ pub fn plan_from_reply(reply: &Reply, had_composition: bool, code: u16) -> KeyPl
 pub enum EditIntent {
     Update(UpdatePayload),
     Commit(String),
-}
-
-impl EditIntent {
-    /// 日志用的简述；用户文本按隐私开关脱敏。
-    pub fn describe(&self) -> String {
-        match self {
-            EditIntent::Update(u) => format!(
-                "update preedit={} cands={}",
-                crate::logger::text(&u.preedit),
-                u.candidates.len()
-            ),
-            EditIntent::Commit(text) => format!("commit {}", crate::logger::text(text)),
-        }
-    }
 }
 
 #[cfg(test)]

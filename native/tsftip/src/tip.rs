@@ -7,10 +7,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use windows::core::{implement, Interface, IUnknownImpl, Ref, Result, BOOL, GUID};
+use windows::core::{implement, IUnknownImpl, Interface, Ref, Result, BOOL, GUID};
 use windows::Win32::Foundation::{E_FAIL, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, GetKeyboardState, MapVirtualKeyW, ToUnicodeEx, HKL, MAPVK_VK_TO_VSC, VK_SHIFT,
+    GetKeyboardLayout, GetKeyboardState, MapVirtualKeyW, ToUnicodeEx, HKL, MAPVK_VK_TO_VSC,
+    VK_SHIFT,
 };
 use windows::Win32::UI::TextServices::{
     ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfDocumentMgr, ITfEditRecord,
@@ -425,10 +426,17 @@ impl ITfTextInputProcessorEx_Impl for Tip_Impl {
 
 impl ITfKeyEventSink_Impl for Tip_Impl {
     fn OnSetFocus(&self, _foreground: BOOL) -> Result<()> {
+        let _hot = crate::logger::hot_path();
         Ok(())
     }
 
-    fn OnTestKeyDown(&self, _pic: Ref<ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+    fn OnTestKeyDown(
+        &self,
+        _pic: Ref<ITfContext>,
+        wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> Result<BOOL> {
+        let _hot = crate::logger::hot_path();
         let vk = (wparam.0 & 0xFFFF) as u16;
         // Shift 轻按的跟踪放在 Test 回调：它对每个按键都先于 Do 回调到达，
         // 而 Shift 本身不需要被吞，Do 回调不会收到它。
@@ -445,6 +453,7 @@ impl ITfKeyEventSink_Impl for Tip_Impl {
     }
 
     fn OnTestKeyUp(&self, _pic: Ref<ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        let _hot = crate::logger::hot_path();
         let vk = (wparam.0 & 0xFFFF) as u16;
         if vk == VK_SHIFT.0 {
             // 轻按切换中英：中间没有别的按键才算。抬起放行——按下时本就没吞，
@@ -460,6 +469,7 @@ impl ITfKeyEventSink_Impl for Tip_Impl {
     }
 
     fn OnKeyDown(&self, pic: Ref<ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
+        let _hot = crate::logger::hot_path();
         let Some(ctx) = pic.cloned() else {
             return Ok(BOOL::from(false));
         };
@@ -488,6 +498,7 @@ impl ITfKeyEventSink_Impl for Tip_Impl {
     }
 
     fn OnKeyUp(&self, _pic: Ref<ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        let _hot = crate::logger::hot_path();
         // 引擎只在按下时推进状态机（05）：抬起不发 IPC。TSF 用本回调的 *pfEaten 决定
         // 是否吞键，所以这里必须给出与 Test 阶段相同的答案，否则孤儿 KeyUp 会漏给应用。
         let vk = (wparam.0 & 0xFFFF) as u16;
@@ -501,6 +512,7 @@ impl ITfKeyEventSink_Impl for Tip_Impl {
     }
 
     fn OnPreservedKey(&self, _pic: Ref<ITfContext>, _guid: *const GUID) -> Result<BOOL> {
+        let _hot = crate::logger::hot_path();
         Ok(BOOL::from(false))
     }
 }
@@ -514,11 +526,7 @@ impl ITfThreadMgrEventSink_Impl for Tip_Impl {
         Ok(())
     }
 
-    fn OnSetFocus(
-        &self,
-        focus: Ref<ITfDocumentMgr>,
-        _previous: Ref<ITfDocumentMgr>,
-    ) -> Result<()> {
+    fn OnSetFocus(&self, focus: Ref<ITfDocumentMgr>, _previous: Ref<ITfDocumentMgr>) -> Result<()> {
         // 焦点迁移是竞态高发区：先收尾旧会话，再为新文档开会话。
         self.leave();
         // text edit sink 挂在 context 上：先撤旧的，避免每换一次焦点多挂一份。

@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"runtime/debug"
 	"time"
 
 	"github.com/luobochuanqi/silk-ime/internal/engine"
@@ -77,7 +76,7 @@ func (c *conn) run() {
 	defer func() {
 		if r := recover(); r != nil {
 			reason = "panic"
-			c.log.Error("连接处理崩溃", "panic", r, "stack", string(debug.Stack()))
+			c.log.Error("连接处理崩溃", logging.Sensitive("panic", r))
 		}
 		orphans := c.client.Len()
 		c.client.Close()
@@ -91,7 +90,8 @@ func (c *conn) run() {
 		frame, err := ipc.ReadFrame(c.nc)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				reason = err.Error()
+				reason = "读取失败"
+				c.log.Warn("读取失败，断开连接", logging.Sensitive("err", err))
 			}
 			return
 		}
@@ -99,7 +99,7 @@ func (c *conn) run() {
 		env, err := ipc.Decode(frame)
 		if err != nil {
 			reason = "畸形帧"
-			c.log.Warn("解码失败，断开连接", "err", err)
+			c.log.Warn("解码失败，断开连接", logging.Sensitive("err", err))
 			return
 		}
 		if !c.handshaked && env.Type != ipc.TypeHello && env.Type != ipc.TypePing {
@@ -153,7 +153,7 @@ func (c *conn) hello(env ipc.Envelope) bool {
 	if !c.handshaked {
 		c.handshaked = true
 		c.log = c.log.With("pid", msg.PID)
-		c.log.Info("握手完成", "build", msg.Build, "caps", msg.Caps)
+		c.log.Info("握手完成", logging.Text("build", msg.Build), "caps", msg.Caps)
 	}
 	mode := c.mgr.Mode()
 	c.send(ipc.TypeWelcome, env, ipc.Welcome{V: ipc.Version, Cfg: ipc.Config{
@@ -173,7 +173,7 @@ func (c *conn) request(env ipc.Envelope) (engine.Response, error) {
 			return engine.Response{}, err
 		}
 		c.hwnd, c.anchor, c.view = uintptr(msg.HWND), silkRect{}, nil
-		c.log.Debug("焦点进入", "sid", env.SID, "app", msg.App)
+		c.log.Debug("焦点进入", logging.Identifier("sid", env.SID), logging.Text("app", msg.App))
 		return c.client.FocusIn(env.SID, msg.App), nil
 	case ipc.TypeFocusOut:
 		return c.client.FocusOut(env.SID)
@@ -261,7 +261,7 @@ func (c *conn) reply(env ipc.Envelope, resp engine.Response) {
 func (c *conn) caret(env ipc.Envelope) {
 	msg, err := decode[ipc.Caret](env)
 	if err != nil {
-		c.log.Warn("caret 载荷非法", "err", err)
+		c.log.Warn("caret 载荷非法", logging.Sensitive("err", err))
 		return
 	}
 	c.anchor = silkRect{x: msg.Rect.X, y: msg.Rect.Y, w: msg.Rect.W, h: msg.Rect.H}
@@ -289,7 +289,7 @@ func (c *conn) send(typ string, req ipc.Envelope, payload any) {
 		}
 	}
 	if err != nil {
-		c.log.Warn("发送失败", "type", typ, "id", req.ID, "err", err)
+		c.log.Warn("发送失败", logMessageType(typ), "id", req.ID, logging.Sensitive("err", err))
 	}
 }
 
@@ -302,7 +302,7 @@ func (c *conn) fail(env ipc.Envelope, err error) {
 	case errors.Is(err, session.ErrUnknownSession):
 		code = ipc.CodeUnknownSession
 	}
-	c.log.Warn("请求失败", "type", env.Type, "sid", env.SID, "id", env.ID, "code", code, "err", err)
+	c.log.Warn("请求失败", logMessageType(env.Type), logging.Identifier("sid", env.SID), "id", env.ID, "code", code, logging.Sensitive("err", err))
 	c.send(ipc.TypeError, env, ipc.Error{ID: env.ID, Code: code, Msg: err.Error()})
 }
 
@@ -316,13 +316,25 @@ func (c *conn) trace(env ipc.Envelope, resp engine.Response, dur time.Duration) 
 		return
 	}
 	attrs := []any{
-		"type", env.Type, "sid", env.SID, "id", env.ID, "dur", dur,
+		logMessageType(env.Type), logging.Identifier("sid", env.SID), "id", env.ID, "dur", dur,
 		logging.Text("preedit", resp.Preedit), "cands", len(resp.Candidates), "page", resp.PageIndex,
 	}
 	if resp.Commit != "" {
 		attrs = append(attrs, logging.Text("commit", resp.Commit))
 	}
 	c.log.Log(context.Background(), level, "请求", attrs...)
+}
+
+// 已知协议枚举可以原样记录，未知值仍是可能含用户输入的不可信文本。
+func logMessageType(typ string) slog.Attr {
+	switch typ {
+	case ipc.TypeHello, ipc.TypeWelcome, ipc.TypeFocusIn, ipc.TypeFocusOut,
+		ipc.TypeKey, ipc.TypeAction, ipc.TypeUpdate, ipc.TypeCommit, ipc.TypeCaret,
+		ipc.TypeShow, ipc.TypeHide, ipc.TypePing, ipc.TypePong, ipc.TypeError, ipc.TypeBye:
+		return slog.String("type", typ)
+	default:
+		return logging.Text("type", typ)
+	}
 }
 
 func decode[T any](env ipc.Envelope) (T, error) {

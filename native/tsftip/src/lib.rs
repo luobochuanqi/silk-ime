@@ -17,14 +17,15 @@ mod util;
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use windows::core::{GUID, Interface, IUnknown, Result, HRESULT};
 use windows::core::BOOL;
+use windows::core::{IUnknown, Interface, Result, GUID, HRESULT};
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOINTERFACE, E_POINTER, HINSTANCE, HMODULE,
     HWND,
 };
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
+use windows::Win32::System::Threading::ExitProcess;
 
 /// 本 DLL 的模块句柄，供注册找自身路径。
 static MODULE: AtomicIsize = AtomicIsize::new(0);
@@ -111,10 +112,10 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     }
 }
 
-/// rundll32 入口，签名固定为 `(HWND, HINSTANCE, LPSTR cmd, int)`。
+/// SilkRegister 是专用 rundll32 入口；完成注册后退出进程，成功为 0，失败为 1。
 ///
 /// # Safety
-/// `cmd` 由 rundll32 传入 NUL 结尾的 ANSI 串，可能为空。
+/// 仅供 rundll32 调用，禁止在 COM 宿主内调用；`cmd` 是 NUL 结尾的 ANSI 串或空指针。
 #[no_mangle]
 pub unsafe extern "system" fn SilkRegister(
     _hwnd: HWND,
@@ -124,10 +125,12 @@ pub unsafe extern "system" fn SilkRegister(
 ) {
     // SAFETY: cmd 按 rundll32 契约是 NUL 结尾的 ANSI 串或空指针，cmd_arg 自己判空。
     let scope = unsafe { reg::cmd_arg(cmd) };
-    reg::run_register(scope.as_deref());
+    let ok = reg::run_register(scope.as_deref());
+    // SAFETY: 此入口仅运行于专用 rundll32 进程，注册资源已在返回前释放。
+    unsafe { ExitProcess(u32::from(!ok)) };
 }
 
-/// 注销入口，逆序清理三类注册。
+/// SilkUnregister 是专用 rundll32 入口；逆序清理注册后退出进程，成功为 0，失败为 1。
 ///
 /// # Safety
 /// 同 [`SilkRegister`]。
@@ -140,22 +143,34 @@ pub unsafe extern "system" fn SilkUnregister(
 ) {
     // SAFETY: 同 SilkRegister。
     let scope = unsafe { reg::cmd_arg(cmd) };
-    reg::run_unregister(scope.as_deref());
+    let ok = reg::run_unregister(scope.as_deref());
+    // SAFETY: 此入口仅运行于专用 rundll32 进程，注销资源已在返回前释放。
+    unsafe { ExitProcess(u32::from(!ok)) };
 }
 
-/// 补登记：把已有 profile 重新启用进当前用户键盘列表。
+/// SilkRegisterSelf 是专用 rundll32 补登记入口；完成后退出进程，成功为 0，失败为 1。
+///
+/// # Safety
+/// 仅供 rundll32 调用，禁止在 COM 宿主内调用；四个参数由 rundll32 提供，本入口不读取。
 #[no_mangle]
-pub extern "system" fn SilkRegisterSelf() -> HRESULT {
-    if reg::register_self() {
-        HRESULT(0)
-    } else {
-        HRESULT(0x80004005u32 as i32)
-    }
+pub unsafe extern "system" fn SilkRegisterSelf(
+    _hwnd: HWND,
+    _instance: HINSTANCE,
+    _cmd: *const u8,
+    _show: i32,
+) {
+    let ok = reg::register_self();
+    // SAFETY: 此入口仅运行于专用 rundll32 进程，注册资源已在返回前释放。
+    unsafe { ExitProcess(u32::from(!ok)) };
 }
 
 /// DllMain 只保存模块句柄：这里不允许建 COM 对象、加载渲染栈或起线程。
 #[no_mangle]
-extern "system" fn DllMain(module: HMODULE, reason: u32, _reserved: *mut core::ffi::c_void) -> BOOL {
+extern "system" fn DllMain(
+    module: HMODULE,
+    reason: u32,
+    _reserved: *mut core::ffi::c_void,
+) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         set_module(module);
     } else if reason == DLL_PROCESS_DETACH {
@@ -163,4 +178,3 @@ extern "system" fn DllMain(module: HMODULE, reason: u32, _reserved: *mut core::f
     }
     BOOL::from(true)
 }
-

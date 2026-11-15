@@ -28,6 +28,11 @@ Silk 已有可运行基座（引擎 + TSF 适配层）。贡献应优先解决�
 
 ## 报告问题
 
-通过 [GitHub Issues](https://github.com/luobochuanqi/silk-ime/issues) 提交问题，尽量包含 Windows 版本、Silk 版本或提交号、复现步骤、预期行为和实际行为。日志与示例须先移除个人信息。
+通过 [GitHub Issues](https://github.com/luobochuanqi/silk-ime/issues) 提交问题，尽量包含 Windows 版本、Silk 版本或提交号、复现步骤、预期行为和实际行为。
+
+- 日志位于 `%LOCALAPPDATA%\Silk\logs\`：`silkhost.log` 是宿主日志，`tsftip.log` 是目标应用内的 TIP 日志；发生滚动时一并检查同目录备份，提供故障前后相关片段即可。
+- 附上本次 `silkhost 启动` 记录：包含 Silk build 版本（本地构建可能为 `(devel)`）、宿主 PID、数据目录，以及 Windows 内核版本/build、进程架构、本机架构、Go 版本和进程可用逻辑 CPU 数。
+- 环境信息仅由 host 启动时采集一次，不运行外部命令，也不采集机器名、用户名、SID、机器 GUID、序列号或网络地址。关联两份日志时使用 host 握手行的对端 `pid` 与 TIP 行的 `pid`，不要将其与 host 启动行的宿主 PID 混淆。
+- 默认不记录输入、候选和上屏原文；`SILK_LOG=debug` 只增加排障元数据，只有显式设置 `SILK_LOG_TEXT=1` 才允许记录原文，不建议为公开反馈开启。临时调整环境变量后需重启目标应用及现有 host，排障结束后撤销设置并重新启动。
 
 安全问题请遵循 [安全政策](SECURITY.md)，不要通过公开 Issue 披露。

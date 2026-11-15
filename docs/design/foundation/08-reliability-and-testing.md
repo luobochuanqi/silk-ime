@@ -53,7 +53,7 @@ graph TB
 
 | 通道 | 内容 | 隐私约束 |
 | --- | --- | --- |
-| 运行日志 | 结构化（级别/组件/耗时/错误码），滚动 5×2 MB | **不记录用户文本与候选内容**；仅元数据（按键计数、延迟分位、降级事件） |
+| 运行日志 | 结构化 logfmt（级别/组件/耗时/错误码），滚动上限见下表 | 默认不记录输入、候选与上屏原文；仅排障元数据，原文须显式开启 |
 | 诊断导出 | 版本、配置快照、日志尾部、注册表状态，人工触发一键导出 | 导出前展示内容清单 |
 | 崩溃收集 | shim/host 的 minidump（本地保存，默认不上传） | 无网络路径（基座无任何联网代码） |
 | 性能计数 | 热路径分位数（内存环形缓冲） | 仅数值 |
@@ -66,14 +66,27 @@ graph TB
 | --- | --- | --- |
 | 实现 | `log/slog` TextHandler（`internal/logging`） | `log` 门面 + 自带文件输出（`tsftip/src/logger.rs`） |
 | 文件 | `%LOCALAPPDATA%\Silk\logs\silkhost.log`，2 MB × 5 份滚动 | 同目录 `tsftip.log`，所有宿主进程共写，1 MB 滚动保留 1 份 |
-| 关联键 | `conn=<连接号> pid=<对端进程>` | `pid= app= tid=` |
+| 关联键 | `conn=<连接号> pid=<对端进程>`（握手及后续连接日志）；启动行的 `pid` 是 host 自身 | `pid= app= tid=` |
 | 级别 | `silk.toml` 的 `log_level`，环境变量 `SILK_LOG` 优先 | `SILK_LOG` |
 
-级别约定：`info` 只记生命周期（启动、连接、握手、断开及原因）与异常；`warn` 记降级事件（应答超时放行、编辑会话失败、请求处理超过 10 ms）；`debug` 逐请求/逐键记录类别、id、耗时与结果。shim 同步写文件、不起线程（崩溃前的最后几行最有价值），并装 panic hook 先落日志；host 每条连接带 panic 兜底，单连接崩溃不拖垮进程。
+消息使用简洁中文，字段名保持稳定，变量通过字段表达。级别约定：`info` 记录生命周期（启动、连接、握手、断开及原因）与关键状态；`warn` 记录可恢复异常和降级（应答超时放行、编辑会话失败、请求处理超过 10 ms）；`error` 记录操作失败，附带错误及必要上下文；`debug` 用于逐请求/逐键的类别、id、耗时与结果。热路径日志应节制，避免未启用级别的昂贵计算与重复失败刷屏。shim 同步写文件、不起线程（崩溃前的最后几行最有价值），并装 panic hook 先落日志；host 每条连接带 panic 兜底，单连接崩溃不拖垮进程。
 
-用户文本默认只记字符数；本机排障需要看原文时设 `SILK_LOG_TEXT=1`。
+host 在现有 `silkhost 启动` 行中一次性记录环境，不另起重复的启动日志，也不在每个 TIP 进程重复采集：
 
-排障示例：`setx SILK_LOG debug` 后重启目标应用（shim 随宿主进程读取环境变量；host 由 shim 拉起时继承），用 `Get-Content -Wait` 跟踪两份日志，按 `pid` 把 shim 一侧的 `id=` 与 host 一侧的 `conn=… id=` 对上。
+| 字段 | 含义与来源 |
+| --- | --- |
+| `version`、`pid`、`data` | 既有 Silk build 版本、host PID、数据目录；本地构建的版本可能为 `(devel)` |
+| `windows_version`、`windows_build` | `x/sys/windows.RtlGetVersion` 返回的 Windows 内核主/次版本与 build，不依赖应用清单声明；Windows 10/11 都可能为 `10.0`，须结合 build 判断 |
+| `process_arch` | `runtime.GOARCH`，当前 host 进程架构 |
+| `native_arch` | `IsWow64Process2` 返回的本机架构，例如 `process_arch=amd64 native_arch=arm64` 表示 ARM64 上的 x64 模拟运行 |
+| `go_version` | `runtime.Version()`，构建宿主的 Go 版本 |
+| `cpu_logical` | `runtime.NumCPU()`，进程启动时可用的逻辑 CPU 数，并非物理核心数 |
+
+本机架构查询失败时省略 `native_arch`，仅附带 `native_arch_err`；未识别的机器类型保留系统原始数值 `native_machine`，不填入猜测值。环境采集只调用进程内 API，不运行外部命令，不采集机器名、用户名、SID、机器 GUID、序列号或网络地址。启动行遵守日志级别过滤，反馈环境时应保留默认 `info` 或开启 `debug`。
+
+用户输入、候选和上屏原文默认经统一脱敏入口只记字符数，`SILK_LOG=debug` 不解除脱敏；仅本机排障确需原文时显式设置 `SILK_LOG_TEXT=1`。日志仍可能通过数据目录、应用路径和错误内容包含个人信息，发送反馈前须检查并脱敏；开启过原文日志时也要处理相关滚动备份，排障结束后撤销开关。
+
+排障示例：`setx SILK_LOG debug` 后重启目标应用及现有 host（shim 随宿主进程读取环境变量，host 由 shim 拉起时继承；已有进程不会自动刷新），用 `Get-Content -Wait` 跟踪两份日志。按 host 握手行的对端 `pid` 与 TIP 日志的 `pid` 关联，再将 shim 的 `id=` 与 host 的 `conn=… id=` 对齐；host 启动行的 `pid` 是 host 自身，不能拿它匹配 TIP PID。反馈时附本次启动行与故障前后片段即可；排障后删除临时环境变量并重启相关进程。
 
 ## 测试金字塔
 
@@ -83,7 +96,7 @@ graph TB
 | 协议一致性 | Go/Rust 共享 JSON fixtures 双向编解码断言 + 帧 fuzz | 版本协商、边界、畸形输入（04） |
 | 集成 | 自研 mini TSF 测试宿主 + 合成按键流，断言 commit 序列 | shim↔host↔engine 全链路 |
 | 宿主兼容 | 手测清单：03 矩阵 + 上方回归基准场景 | Win10/11 × x64/arm64 × 宿主类别 |
-| 安装/升级 | 干净 VM 矩阵：per-user/per-machine、升级锁定、卸载保留 | 07 全流程 |
+| 安装/升级 | 干净 VM 矩阵：管理员安装到 Program Files、升级锁定、卸载保留 | 07 全流程 |
 | 性能 | 基准进 CI（退化 >20% 报警）；端到端计时探针 | 05 预算表全项 |
 
 手测清单模板随仓库维护（`docs/testing/`，实现阶段建），每条 = 场景 + 期望 + 通过记录。

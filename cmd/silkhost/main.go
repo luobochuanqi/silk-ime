@@ -66,7 +66,7 @@ func run() error {
 	} else {
 		defer logFile.Close()
 	}
-	slog.Info("silkhost 启动", "version", buildVersion(), "pid", os.Getpid(), "data", paths.Dir)
+	logStartup(paths.Dir)
 	if cfgErr != nil {
 		slog.Error("配置无效，使用默认配置", "path", paths.Config, "err", cfgErr)
 	}
